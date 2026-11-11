@@ -2,10 +2,6 @@
   <img src="assets/logo_fbq_splash.png" alt="FBQ" style="width: 60%; height: auto;">
 </p>
 
-<div align="center" style="line-height: 1;">
-  <a href="https://github.com/yousaf2018/FBQ" target="_blank"><img alt="Repository" src="https://img.shields.io/badge/Repository-FBQ-EB602B?logo=github&logoColor=white"/></a>
-  <a href="https://doi.org/10.64898/2026.09.19.752854" target="_blank"><img alt="bioRxiv" src="https://img.shields.io/badge/bioRxiv-10.64898%2F2026.09.19.752854-007FCB?logo=biorxiv&logoColor=white"/></a>
-</div>
 <br>
 
 ---
@@ -63,12 +59,41 @@ Use **Advanced Tracking** to configure individual stages and parameters, or
 The full workflow, every parameter and the output format are documented in the
 [manual](docs/MANUAL.md).
 
+## Behavior Quantification
+
+The **Behavior Quantification** dialog runs inference on a trained model and
+produces per-frame head / center / tail keypoints plus behavioral metrics
+(speed, acceleration, angular velocity) for every fish:
+
+- **Head / center / tail keypoints** — head is placed at the leading end of
+  movement (fish swims forward, head leads), tail at the trailing end, center
+  at the OBB centroid. Orientation follows the AMADEUS direction-estimation
+  logic: consecutive OBB long axes are aligned by dot-product sign and the
+  global sign is chosen by majority vote against the motion vectors.
+- **Direction classes** — 8-way quantized heading (upper, upper_right, right,
+  lower_right, lower, lower_left, left, upper_left) matching AMADEUS
+  `angle_to_class`.
+- **Multi-tank / multi-ROI** — each drawn ROI is tracked independently. Track
+  IDs are unique across ROIs and shown as `Tank1-ID1`, `Tank2-ID3`, etc. The
+  tank label comes from the ROI name you set in the GUI (default `Tank 1`,
+  `Tank 2`, …).
+- **Heading arrow** — drawn from tail to head; its length scales with the
+  bounding-box size so it stays proportional across fish of different sizes.
+- **Configurable display** — arrow size, ID font size, box thickness, keypoint
+  radius and font size, and trail length are adjustable in the Behavior
+  Quantification dialog under **Display Settings**.
+- **Outputs** — an annotated MP4 video (OBB boxes, keypoints, heading arrows,
+  trails, speed labels) and a CSV with per-fish per-frame columns:
+  `frame, track_id, class_name, cx, cy, w, h, angle, head_x, head_y,
+  center_x, center_y, tail_x, tail_y, heading, speed, angular_velocity,
+  acceleration`.
+
 ## Outputs
 
-The standard output is a CSV with, per fish and per frame: identity, OBB center
-and dimensions, and head direction in degrees. Columns named `heading` store
-the head direction. Front and rear keypoints are derived from OBB geometry;
-they are not directly detected anatomical landmarks.
+The standard Easy Tracking output is a CSV with, per fish and per frame:
+identity, OBB center and dimensions, and head direction in degrees. Columns
+named `heading` store the head direction. Front and rear keypoints are derived
+from OBB geometry; they are not directly detected anatomical landmarks.
 
 ```
 frame, cx0, cy0, w0, h0, heading0, cx1, cy1, w1, h1, heading1, ...
