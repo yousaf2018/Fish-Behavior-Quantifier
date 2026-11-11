@@ -2,9 +2,6 @@
   <img src="assets/logo_fbq_splash.png" alt="FBQ" style="width: 60%; height: auto;">
 </p>
 
-<div align="center" style="line-height: 1;">
-  <a href="https://github.com/yousaf2018/FBQ" target="_blank"><img alt="Repository" src="https://img.shields.io/badge/Repository-FBQ-EB602B?logo=github&logoColor=white"/></a>
-</div>
 <br>
 
 ---
