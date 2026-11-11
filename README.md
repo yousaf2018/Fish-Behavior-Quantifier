@@ -4,7 +4,6 @@
 
 <div align="center" style="line-height: 1;">
   <a href="https://github.com/yousaf2018/FBQ" target="_blank"><img alt="Repository" src="https://img.shields.io/badge/Repository-FBQ-EB602B?logo=github&logoColor=white"/></a>
-  <a href="https://doi.org/10.64898/2026.09.19.752854" target="_blank"><img alt="bioRxiv" src="https://img.shields.io/badge/bioRxiv-10.64898%2F2026.09.19.752854-007FCB?logo=biorxiv&logoColor=white"/></a>
 </div>
 <br>
 
