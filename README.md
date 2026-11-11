@@ -21,7 +21,10 @@ Matsumura & Dobata, 2026), reworked for fish behavior work. See
 [Attribution and upstream](#attribution-and-upstream) and
 [License](#license).
 
-[![Watch the tool result ]]([https://www.youtube.com/watch?v=pvYrgtg0WFg](https://www.youtube.com/watch?v=6EdLrUhgD30))
+
+[![Watch the Tool Demonstration](https://img.youtube.com/vi/6EdLrUhgD30/maxresdefault.jpg)](https://www.youtube.com/watch?v=6EdLrUhgD30)
+
+**▶ Watch the complete tool demonstration on YouTube**
 
 ## Acknowledgements
 
