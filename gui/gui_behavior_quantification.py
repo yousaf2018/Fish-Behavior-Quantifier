@@ -171,6 +171,33 @@ class BehaviorQuantificationGUI(ctk.CTk):
             row=4, column=0, columnspan=2, sticky="w", padx=10, pady=(2, 10)
         )
 
+        # Display options
+        disp_frame = ctk.CTkFrame(left, corner_radius=6)
+        disp_frame.pack(fill="x", pady=(0, 10))
+        disp_frame.grid_columnconfigure(1, weight=1)
+
+        ctk.CTkLabel(disp_frame, text="Display Settings", font=ctk.CTkFont(weight="bold")).grid(
+            row=0, column=0, columnspan=3, sticky="w", padx=10, pady=(10, 5)
+        )
+
+        ctk.CTkLabel(disp_frame, text="Arrow Size:").grid(row=1, column=0, sticky="w", padx=10, pady=2)
+        self._arrow_size = ctk.IntVar(value=45)
+        ctk.CTkEntry(disp_frame, textvariable=self._arrow_size, width=50).grid(
+            row=1, column=1, sticky="w", padx=10, pady=2
+        )
+
+        ctk.CTkLabel(disp_frame, text="ID Font Size:").grid(row=2, column=0, sticky="w", padx=10, pady=2)
+        self._id_font_size = ctk.DoubleVar(value=0.6)
+        ctk.CTkEntry(disp_frame, textvariable=self._id_font_size, width=50).grid(
+            row=2, column=1, sticky="w", padx=10, pady=2
+        )
+
+        ctk.CTkLabel(disp_frame, text="Box Thickness:").grid(row=3, column=0, sticky="w", padx=10, pady=2)
+        self._box_thickness = ctk.IntVar(value=2)
+        ctk.CTkEntry(disp_frame, textvariable=self._box_thickness, width=50).grid(
+            row=3, column=1, sticky="w", padx=10, pady=2
+        )
+
         # Output directory
         out_frame = ctk.CTkFrame(left, corner_radius=6)
         out_frame.pack(fill="x", pady=(0, 10))
@@ -501,7 +528,7 @@ class BehaviorQuantificationGUI(ctk.CTk):
             messagebox.showinfo("Info", "Select a video first")
             return
         entry = self._video_entries[self._current_video_idx]
-        new_roi = ROIEntry(shape=self._roi_shape_var.get(), label=self._roi_label_entry.get() or f"ROI {len(entry.rois)+1}")
+        new_roi = ROIEntry(shape=self._roi_shape_var.get(), label=self._roi_label_entry.get() or f"Tank {len(entry.rois)+1}")
         entry.rois.append(new_roi)
         self._current_roi_idx = len(entry.rois) - 1
         self._refresh_roi_list()
@@ -527,23 +554,31 @@ class BehaviorQuantificationGUI(ctk.CTk):
                 row=0, column=0, padx=5, pady=5
             )
 
-            label = roi.label or f"ROI {i+1} ({roi.shape})"
-            ctk.CTkLabel(row, text=label, anchor="w").grid(row=0, column=1, sticky="ew", padx=5)
+            label = roi.label or f"Tank {i+1} ({roi.shape})"
+            ctk.CTkLabel(row, text=f"{label}  [{roi.fish_count} fish]", anchor="w").grid(
+                row=0, column=1, sticky="ew", padx=5
+            )
 
             # Fish count entry
             fish_count_var = ctk.StringVar(value=str(roi.fish_count))
             ctk.CTkLabel(row, text="Fish:").grid(row=0, column=2, padx=(10, 2), pady=5)
             fish_spinbox = ctk.CTkEntry(row, textvariable=fish_count_var, width=40)
             fish_spinbox.grid(row=0, column=3, padx=2, pady=5)
-            def _update_fish_count(r=roi, v=fish_count_var):
+
+            def _update_fish_count(r=roi, v=fish_count_var, *, refresh: bool = False):
                 try:
                     val = int(v.get())
                     if val >= 1:
                         r.fish_count = val
+                        if refresh:
+                            self._refresh_roi_list()
                 except ValueError:
                     pass
-            fish_spinbox.bind("<FocusOut>", lambda e: _update_fish_count())
-            fish_spinbox.bind("<Return>", lambda e: _update_fish_count())
+            # Save immediately as the user types (no FocusOut/Return required).
+            fish_count_var.trace_add("write", lambda *args: _update_fish_count())
+            # Refresh the UI label once editing is done.
+            fish_spinbox.bind("<FocusOut>", lambda e: _update_fish_count(refresh=True))
+            fish_spinbox.bind("<Return>", lambda e: _update_fish_count(refresh=True))
 
             ctk.CTkButton(row, text="Edit", width=50,
                           command=lambda idx=i: self._select_roi(idx)).grid(
@@ -701,7 +736,7 @@ class BehaviorQuantificationGUI(ctk.CTk):
                     cx, cy = canvas_points[0]
 
                 # ROI number (1-based) and fish count
-                label_text = f"ROI {i+1} ({roi.fish_count})"
+                label_text = f"Tank {i+1} ({roi.fish_count})"
                 if roi.label:
                     label_text = f"{roi.label} ({roi.fish_count})"
 
@@ -916,6 +951,14 @@ class BehaviorQuantificationGUI(ctk.CTk):
                     cfg["BEHAVIOR"]["EXTRACT_CENTER"] = self._extract_center.get()
                     cfg["BEHAVIOR"]["EXTRACT_TAIL"] = self._extract_tail.get()
                     cfg["BEHAVIOR"]["ANALYSIS"] = self._behavior_analysis.get()
+
+                    # Display settings (arrow size, id font size, box thickness)
+                    cfg["DISPLAY"] = {
+                        "ARROW_SIZE": int(self._arrow_size.get()),
+                        "ID_FONT_SIZE": float(self._id_font_size.get()),
+                        "ID_FONT_THICKNESS": int(self._box_thickness.get()),
+                        "BOX_THICKNESS": int(self._box_thickness.get()),
+                    }
 
                     # Build ROI_SETS from GUI ROIs (normalized coordinates)
                     roi_sets = []
