@@ -1,0 +1,34 @@
+FBQ Closed-Beta Test Build Notice
+=================================
+
+This build is distributed for closed-beta testing only.
+
+It is a modified version of a project licensed under the GNU Affero General
+Public License v3.0 only (AGPL-3.0-only). Under AGPL-3.0 section 13, if you
+modify this program and let users interact with it remotely through a
+computer network, you must offer those users the opportunity to receive the
+Corresponding Source of your modified version.
+
+The Corresponding Source for this build is distributed with it, in the
+`fbq_runtime/` package of the Colab project folder, and is identified by the
+`fbq_runtime_manifest.json` manifest that records the exact revision and the
+SHA-256 digest of every packaged file.
+
+By using this build you agree that:
+
+  1. You will not redistribute it publicly, commercially, or in any form that
+     implies an endorsement by the upstream authors without their written
+     permission.
+  2. You will cite the upstream AMADEUS publication in any work that uses
+     results obtained with this software:
+
+     Yusuke Notomi, Kentarou Matsumura, and Shigeto Dobata (2026).
+     AMADEUS: Annotation-free multi-animal direction estimation using
+     self-supervised learning. bioRxiv.
+     https://doi.org/10.64898/2026.09.19.752854
+
+  3. You will report defects and behaviour findings to the FBQ maintainers.
+
+The software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND, express or
+implied, as stated in the AGPL-3.0 and in the third-party notices that
+accompany this build.

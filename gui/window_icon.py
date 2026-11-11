@@ -1,0 +1,281 @@
+# Copyright (C) 2026 Yusuke Notomi
+# SPDX-License-Identifier: AGPL-3.0-only
+
+from __future__ import annotations
+
+import os
+import sys
+import tempfile
+import tkinter as tk
+import tkinter.font as tkfont
+from pathlib import Path
+from typing import Any, List
+
+import customtkinter as ctk
+from PIL import Image, ImageTk
+
+try:
+    from .project_paths import gui_asset
+    from .copyable_text import install_right_click_copy
+except ImportError:  # Preserve direct execution with: python gui/<script>.py
+    from project_paths import gui_asset
+    from copyable_text import install_right_click_copy
+
+
+APP_USER_MODEL_ID = "FBQ.GUI"
+WINDOW_ICON_FILE = "logo_fbq_mini.png"
+WINDOW_ICON_SIZES = (16, 32, 48, 256)
+WINDOW_ICON_REFRESH_DELAYS_MS = (50, 250, 500, 1000, 2000)
+
+
+def tk_font_spec(
+    root: tk.Misc,
+    family: str,
+    point_size: int,
+    weight: str = "normal",
+):
+    """Return consistently sized Home fonts across Linux Tk font backends.
+
+    Xft provides scalable fonts; preserve the existing Roboto sizing there.
+    Some Linux builds of Tk 9 report the old "x11" font system instead,
+    where requested point sizes can render as tiny bitmap fonts. Calibrate
+    the *measured* line height against the Windows 96-DPI baseline in that
+    case rather than relying on nominal point sizes.
+    """
+    if not sys.platform.startswith("linux"):
+        return family, point_size, weight
+
+    try:
+        backend = str(root.tk.call("tk::pkgconfig", "get", "fontsystem")).lower()
+    except tk.TclError:
+        backend = ""
+
+    if backend != "x11":
+        linux_family = family
+        linux_size = point_size
+        if family.casefold() == "arial":
+            families = {name.casefold(): name for name in tkfont.families(root)}
+            if "roboto" in families:
+                linux_family = families["roboto"]
+                if point_size == 13 and weight == "normal":
+                    linux_size = 12
+        return tkfont.Font(root=root, family=linux_family, size=linux_size, weight=weight)
+
+    target_px = max(1, round(point_size * 96.0 / 72.0))
+    font = tkfont.Font(root=root, family=family, size=point_size, weight=weight)
+
+    # Restore the measured-size correction originally used before the Xft
+    # runtime was added. Bound the search to avoid excessive Tk font probes.
+    low, high = 1, max(256, point_size * 8)
+    while low < high:
+        mid = (low + high) // 2
+        font.configure(size=mid)
+        measured = int(font.metrics("linespace"))
+        if measured < target_px:
+            low = mid + 1
+        else:
+            high = mid
+
+    candidates = range(max(1, low - 3), low + 4)
+    best_size = min(candidates, key=lambda size: _font_height_error(font, size, target_px))
+    font.configure(size=best_size)
+    return font
+
+
+def _font_height_error(font: tkfont.Font, size: int, target_px: int) -> int:
+    font.configure(size=size)
+    return abs(int(font.metrics("linespace")) - target_px)
+
+
+def configure_taskbar_identity() -> None:
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(APP_USER_MODEL_ID)
+    except (AttributeError, OSError):
+        pass
+
+
+#: The DPI a display is assumed to have when it reports nothing usable.
+DEFAULT_DPI = 96.0
+
+#: A display below this DPI is misconfigured rather than a dense panel.
+MIN_PLAUSIBLE_DPI = 72.0
+
+#: The largest scaling factor applied; beyond 2x the layout stops fitting.
+MAX_SCALING_FACTOR = 2.0
+
+
+def configure_dpi_scaling(window: tk.Misc) -> None:
+    """Apply the display's reported DPI to CustomTkinter and Tk on Linux.
+
+    WSLg reports the effective X display DPI through Tk. Query it directly;
+    launching Windows PowerShell to infer the host DPI adds startup work and
+    cannot correct Tk's font backend or missing fontconfig support.
+
+    The reported DPI is only trusted in the upward direction. X servers
+    frequently advertise a wrong physical size -- a 1920x1080 screen
+    reported as 903x508 mm yields 54 DPI -- and honouring that value
+    shrinks every widget to roughly half size while the fonts keep their
+    baseline, which leaves the interface clipped and unreadable. A dense
+    panel is still honoured, so HiDPI displays keep their scaling.
+    """
+    if not sys.platform.startswith("linux"):
+        return
+
+    try:
+        dpi = float(window.winfo_fpixels("1i"))
+    except (tk.TclError, TypeError, ValueError):
+        return
+
+    if not dpi or dpi <= 0:
+        return
+
+    if dpi < MIN_PLAUSIBLE_DPI:
+        print(
+            f"[FBQ] The display reports {dpi:.0f} DPI, which is not a usable value; "
+            f"rendering at {DEFAULT_DPI:.0f} DPI.",
+            flush=True,
+        )
+        return
+
+    factor = min(max(dpi / DEFAULT_DPI, 1.0), MAX_SCALING_FACTOR)
+    ctk.set_widget_scaling(factor)
+    ctk.set_window_scaling(factor)
+
+    try:
+        window.tk.call("tk", "scaling", max(dpi, DEFAULT_DPI) / 72.0)
+    except tk.TclError:
+        pass
+
+def install_window_icon(window: tk.Misc) -> None:
+    """Apply FBQ's icon now, and again shortly after, once the window
+    manager has actually mapped the window. A single application while the
+    window is still withdrawn/unmapped (as it commonly is, e.g. behind a
+    splash screen) is not reliably picked up by every window
+    manager/taskbar bridge -- Windows fights CTk's own delayed default-icon
+    override this way already; WSLg's icon bridge needs the same retry even
+    though CTk itself never overrides the icon on Linux.
+    """
+    install_right_click_copy(window)
+    set_window_icon(window)
+    if os.name == "nt" or sys.platform.startswith("linux"):
+        for delay_ms in WINDOW_ICON_REFRESH_DELAYS_MS:
+            try:
+                window.after(delay_ms, set_window_icon, window)
+            except tk.TclError:
+                return
+
+
+def set_window_icon(window: tk.Misc) -> None:
+    """Apply the FBQ logo to a Tk/CTk title bar and taskbar."""
+    try:
+        if not window.winfo_exists():
+            return
+    except tk.TclError:
+        return
+
+    icon_path = gui_asset(WINDOW_ICON_FILE)
+    if not icon_path.is_file():
+        return
+
+    try:
+        with Image.open(icon_path) as source:
+            source = source.convert("RGBA")
+            content_box = source.getbbox()
+            if content_box:
+                source = source.crop(content_box)
+
+            icons: List[ImageTk.PhotoImage] = []
+            largest_square: Image.Image | None = None
+            for size in WINDOW_ICON_SIZES:
+                contained = source.copy()
+                contained.thumbnail((size, size), Image.LANCZOS)
+                square = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+                offset = ((size - contained.width) // 2, (size - contained.height) // 2)
+                square.alpha_composite(contained, offset)
+                icons.append(ImageTk.PhotoImage(square, master=window))
+                largest_square = square
+
+        window.iconphoto(True, *icons)
+        setattr(window, "FBQ_WINDOW_ICONS", icons)
+
+        if os.name == "nt" and largest_square is not None:
+            cache_dir = Path(tempfile.gettempdir()) / "FBQ"
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            ico_path = cache_dir / f"{Path(WINDOW_ICON_FILE).stem}.ico"
+            largest_square.save(
+                ico_path,
+                format="ICO",
+                sizes=[(size, size) for size in WINDOW_ICON_SIZES],
+            )
+
+            # CTk schedules its blue default icon shortly after creating each
+            # window. Mark the icon as user-defined and set both Tk and native
+            # Windows icon handles so title bar and taskbar stay on FBQ.
+            if hasattr(window, "_iconbitmap_method_called"):
+                setattr(window, "_iconbitmap_method_called", True)
+            try:
+                window.iconbitmap(str(ico_path))
+            except tk.TclError:
+                pass
+            try:
+                window.iconbitmap(default=str(ico_path))
+            except tk.TclError:
+                pass
+            _apply_windows_icon_handles(window, ico_path)
+            setattr(window, "FBQ_WINDOW_ICON_PATH", str(ico_path))
+    except (OSError, tk.TclError):
+        pass
+
+
+def _apply_windows_icon_handles(window: tk.Misc, ico_path: Path) -> None:
+    if os.name != "nt":
+        return
+
+    try:
+        import ctypes
+
+        user32 = ctypes.windll.user32
+        user32.GetParent.restype = ctypes.c_void_p
+        user32.GetParent.argtypes = [ctypes.c_void_p]
+        user32.LoadImageW.restype = ctypes.c_void_p
+        user32.LoadImageW.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_wchar_p,
+            ctypes.c_uint,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_uint,
+        ]
+        user32.SendMessageW.restype = ctypes.c_void_p
+        user32.SendMessageW.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_uint,
+            ctypes.c_size_t,
+            ctypes.c_void_p,
+        ]
+
+        hwnd_value = window.winfo_id()
+        hwnd = ctypes.c_void_p(hwnd_value)
+        parent_hwnd = user32.GetParent(hwnd)
+        target_hwnd = ctypes.c_void_p(parent_hwnd or hwnd.value)
+        handles: dict[int, Any] | None = getattr(window, "FBQ_WINDOW_ICON_HANDLES", None)
+
+        if handles is None:
+            image_icon = 1
+            load_from_file = 0x00000010
+            handles = {
+                0: user32.LoadImageW(None, str(ico_path), image_icon, 16, 16, load_from_file),
+                1: user32.LoadImageW(None, str(ico_path), image_icon, 32, 32, load_from_file),
+            }
+            handles = {icon_type: handle for icon_type, handle in handles.items() if handle}
+            setattr(window, "FBQ_WINDOW_ICON_HANDLES", handles)
+
+        wm_seticon = 0x0080
+        for icon_type, handle in handles.items():
+            user32.SendMessageW(target_hwnd, wm_seticon, icon_type, ctypes.c_void_p(handle))
+    except (AttributeError, OSError, tk.TclError, TypeError, ValueError):
+        pass

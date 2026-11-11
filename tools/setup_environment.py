@@ -1,0 +1,1053 @@
+# Copyright (C) 2026 Yusuke Notomi
+# SPDX-License-Identifier: AGPL-3.0-only
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(PROJECT_ROOT))
+sys.path.insert(0, str(PROJECT_ROOT / "gui"))
+from tools.runtime_profiles import PROFILES, check_support
+from tools.python_runtime import check_python_runtime, python_base_executable, select_python_runtime
+from main.compute_telemetry import (
+    nvidia_driver_present,
+    query_nvidia_driver_info,
+    query_nvidia_smi_failure,
+)
+from splash_ipc import signal_stop  # noqa: E402
+
+NUMPY_VERSION = "1.26.4"
+SCIPY_VERSION = "1.11.4"
+ENVIRONMENT_ROOT = Path(os.environ.get("FBQ_VENV", PROJECT_ROOT / ".venv")).expanduser().absolute()
+READY_MARKER = ENVIRONMENT_ROOT / ".fbq-ready"
+# uv resolves uv.lock, so the executable version is pinned separately in
+# [tool.uv].required-version. The launchers read the same setting and hand over
+# a matching uv; this check keeps a hand-run setup honest too.
+PYPROJECT_FILE = PROJECT_ROOT / "pyproject.toml"
+
+
+def nvidia_gpu_is_available() -> bool:
+    """Return whether a working NVIDIA GPU is reported by the driver."""
+    return query_nvidia_driver_info() is not None
+
+
+def _nvidia_driver_diagnostic() -> str:
+    info = query_nvidia_driver_info()
+    if info is None:
+        return (
+            "nvidia-smi could not report an NVIDIA GPU. On WSL2, FBQ also checks "
+            "/usr/lib/wsl/lib/nvidia-smi even when that directory is not on PATH."
+        )
+    name, driver, executable = info
+    return f"NVIDIA GPU: {name}; driver: {driver}; nvidia-smi: {executable}"
+
+
+def _nvidia_fault_diagnostic() -> str | None:
+    """Explain why an installed NVIDIA GPU cannot be used, when that is the case."""
+    if query_nvidia_driver_info() is not None:
+        return None
+    failure = query_nvidia_smi_failure()
+    if failure is None:
+        return None
+    if not nvidia_driver_present():
+        return (
+            f"An NVIDIA GPU is installed but its driver is not usable: {failure}. "
+            "Install or reload the NVIDIA driver, then run FBQ again."
+        )
+    return (
+        f"An NVIDIA GPU is installed but nvidia-smi cannot query it: {failure}. "
+        "Reboot the machine so the matching NVIDIA kernel module is loaded, then "
+        "run FBQ again to enable GPU processing."
+    )
+
+
+def _nvidia_compute_capability() -> tuple[int, int] | None:
+    """Return GPU0 compute capability using the NVIDIA driver tool."""
+    info = query_nvidia_driver_info()
+    if info is None:
+        return None
+    _, _, executable = info
+    try:
+        result = subprocess.run(
+            [
+                executable,
+                "--query-gpu=compute_cap",
+                "--format=csv,noheader,nounits",
+            ],
+            capture_output=True,
+            text=True,
+            errors="replace",
+            timeout=8,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    first = (result.stdout or "").splitlines()
+    if not first:
+        return None
+    try:
+        major, minor = first[0].strip().split(".", 1)
+        return int(major), int(minor)
+    except (TypeError, ValueError):
+        return None
+
+
+def _nvidia_driver_version() -> tuple[int, ...] | None:
+    info = query_nvidia_driver_info()
+    if info is None:
+        return None
+    _, driver, _ = info
+    try:
+        return tuple(int(part) for part in str(driver).split("."))
+    except (TypeError, ValueError):
+        return None
+
+
+def _driver_at_least(version: tuple[int, ...] | None, minimum: tuple[int, ...]) -> bool:
+    if version is None:
+        return True
+    width = max(len(version), len(minimum))
+    padded_version = version + (0,) * (width - len(version))
+    padded_minimum = minimum + (0,) * (width - len(minimum))
+    return padded_version >= padded_minimum
+
+
+def _is_apple_silicon() -> bool:
+    import platform
+
+    return sys.platform == "darwin" and platform.machine() in ("arm64", "aarch64")
+
+
+def amd_runtime_candidate() -> bool:
+    """Driver hint only, NOT a hardware support verdict; verify real ops later."""
+    import platform
+    if not (sys.platform.startswith("linux") and platform.machine().lower() in {"x86_64", "amd64"}):
+        return False
+    if not Path("/dev/kfd").exists():
+        return False
+    for vendor in Path("/sys/class/drm").glob("card*/device/vendor"):
+        try:
+            if vendor.read_text().strip().lower() == "0x1002":
+                return True
+        except OSError:
+            pass
+    return False
+
+
+def _windows_amd_identity() -> str | None:
+    if sys.platform != "win32":
+        return None
+    try:
+        result = subprocess.run(
+            [
+                "powershell.exe",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "Get-CimInstance Win32_VideoController | "
+                "Where-Object {$_.PNPDeviceID -match 'VEN_1002'} | "
+                "Select-Object Name,DriverVersion,PNPDeviceID | ConvertTo-Json -Compress",
+            ],
+            capture_output=True,
+            text=True,
+            errors="replace",
+            timeout=8,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    value = (result.stdout or "").strip()
+    return value if result.returncode == 0 and value else None
+
+
+def windows_amd_gpu_candidate() -> bool:
+    """Detect an AMD display adapter before installing the Windows ROCm profile."""
+    return _windows_amd_identity() is not None
+
+
+def select_torch_profiles() -> tuple[list[str], str]:
+    """Return ordered accelerator profiles, newest compatible candidate first."""
+    requested = os.environ.get("FBQ_TORCH_PROFILE", "auto").strip().lower()
+    if requested not in {"", "auto"}:
+        check_support(requested)
+        return [requested], (
+            f"Requested PyTorch profile: {requested}; automatic fallback is disabled "
+            "for an explicit profile."
+        )
+    if sys.platform == "darwin":
+        return ["macos"], "Using macOS wheels (MPS/Metal when available, otherwise CPU)."
+    if nvidia_gpu_is_available():
+        capability = _nvidia_compute_capability()
+        driver = _nvidia_driver_version()
+        cuda12_min = (528, 33) if sys.platform == "win32" else (525, 60, 13)
+        cuda13_min = (580,)
+
+        if capability is not None and capability < (5, 0):
+            return ["cpu"], (
+                f"NVIDIA GPU0 compute capability is {capability[0]}.{capability[1]}; "
+                "current FBQ PyTorch profiles require Maxwell (CC 5.0) or newer. "
+                "Using the CPU profile."
+            )
+
+        if not _driver_at_least(driver, cuda12_min):
+            return ["cpu"], (
+                "An NVIDIA GPU was detected, but the installed driver is below the CUDA 12.x "
+                "compatibility floor used by the supported FBQ PyTorch profiles. "
+                "Using the CPU profile. "
+                + _nvidia_driver_diagnostic()
+            )
+
+        if capability is not None and capability < (7, 5):
+            return ["cu126"], (
+                f"NVIDIA GPU0 compute capability is {capability[0]}.{capability[1]}; "
+                "using PyTorch 2.14 + CUDA 12.6 because CUDA 13.x no longer supports "
+                "Maxwell, Pascal or Volta. "
+                + _nvidia_driver_diagnostic()
+            )
+
+        capability_text = (
+            f"GPU0 compute capability {capability[0]}.{capability[1]}"
+            if capability is not None
+            else "GPU0 compute capability could not be queried"
+        )
+
+        if capability is not None and capability >= (10, 0):
+            if not _driver_at_least(driver, cuda13_min):
+                return ["cpu"], (
+                    f"NVIDIA Blackwell GPU0 compute capability is {capability[0]}.{capability[1]}, "
+                    "but Blackwell requires the CUDA 13.2 FBQ profile and the installed "
+                    "driver cannot run CUDA 13.x. Using the CPU profile. "
+                    + _nvidia_driver_diagnostic()
+                )
+            return ["cu132"], (
+                f"NVIDIA Blackwell GPU0 compute capability is {capability[0]}.{capability[1]}; "
+                "using PyTorch 2.14 + CUDA 13.2. "
+                + _nvidia_driver_diagnostic()
+            )
+
+        if not _driver_at_least(driver, cuda13_min):
+            return ["cu126"], (
+                f"An NVIDIA GPU was detected ({capability_text}), but the installed driver "
+                "cannot run CUDA 13.x. Using PyTorch 2.14 + CUDA 12.6. "
+                + _nvidia_driver_diagnostic()
+            )
+
+        return ["cu132", "cu126"], (
+            f"An NVIDIA GPU was detected ({capability_text}); trying PyTorch 2.14 + CUDA 13.2 first. "
+            "PyTorch 2.14 + CUDA 12.6 is retained as the compatibility fallback. "
+            + _nvidia_driver_diagnostic()
+        )
+    if amd_runtime_candidate():
+        return ["rocm100", "rocm72", "cpu"], (
+            "AMD GPU runtime detected on Linux; trying AMD ROCm 10.0 / PyTorch 2.13 first. "
+            "If real GPU computation or torchvision NMS is incompatible, FBQ will "
+            "retry the PyTorch ROCm 7.2 profile and finally the CPU profile."
+        )
+    if windows_amd_gpu_candidate():
+        return ["rocmwin100", "cpu"], (
+            "AMD GPU detected on Windows; trying AMD ROCm 10.0 / PyTorch 2.13 wheels first. "
+            "If the GPU, Windows release, driver, GPU computation or torchvision NMS is "
+            "not compatible with native Windows ROCm, FBQ will use the CPU profile."
+        )
+    nvidia_fault = _nvidia_fault_diagnostic()
+    if nvidia_fault:
+        return ["cpu"], nvidia_fault + " Using the CPU profile."
+    return ["cpu"], "No accelerator runtime candidate detected; using CPU wheels."
+
+
+def select_torch_profile() -> tuple[str, str]:
+    """Compatibility helper returning the preferred profile only."""
+    profiles, explanation = select_torch_profiles()
+    return profiles[0], explanation
+
+
+def venv_python() -> Path:
+    return ENVIRONMENT_ROOT / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+
+
+#: Packages that only exist to satisfy the PyPI build of torch.
+CUDA_RUNTIME_PACKAGE_PREFIXES = ("nvidia-",)
+CUDA_RUNTIME_PACKAGE_NAMES = ("cuda-bindings", "cuda-toolkit", "triton")
+
+
+def cuda_runtime_packages() -> list[str]:
+    """Return the CUDA runtime packages the PyPI torch wheel depends on.
+
+    The accelerator wheels FBQ installs (torch+cpu, torch+cu126,
+    torch+rocm7.2) carry their own runtime, so the PyPI dependencies are
+    dead weight. On a CPU profile they are several gigabytes of download
+    that is thrown away again. The names are read from the lockfile so the
+    list follows the pinned torch version.
+    """
+    try:
+        text = (PROJECT_ROOT / "uv.lock").read_text(encoding="utf-8")
+    except OSError:
+        return []
+    names = set(re.findall(r'^\[\[package\]\]\nname = "([^"]+)"', text, re.MULTILINE))
+    selected = {
+        name for name in names
+        if name.startswith(CUDA_RUNTIME_PACKAGE_PREFIXES)
+        or name in CUDA_RUNTIME_PACKAGE_NAMES
+    }
+    return sorted(selected)
+
+
+def sync_environment(uv_executable: str, profile: str, python: str) -> None:
+    """Sync locked dependencies while preserving the separately managed PyTorch pair.
+
+    ``--no-install-package`` prevents uv from selecting torch/torchvision from
+    the lockfile, while ``--inexact`` is essential here: uv sync is exact by
+    default and would otherwise remove the already-installed CUDA wheels as
+    extraneous packages. The pair is verified and repaired separately below.
+
+    The CUDA runtime packages of the PyPI torch build are excluded as well:
+    every profile FBQ supports installs its own torch wheel, so those
+    gigabytes would only be downloaded and discarded.
+    """
+    selected = PROFILES[profile]
+    sync_extra = selected.sync_extra or profile
+    command = [
+        uv_executable,
+        "sync",
+        "--locked",
+        "--inexact",
+        "--python",
+        python,
+        "--no-dev",
+        "--extra",
+        sync_extra,
+        "--no-install-package",
+        "torch",
+        "--no-install-package",
+        "torchvision",
+    ]
+    for package in cuda_runtime_packages():
+        command.extend(["--no-install-package", package])
+    environment = os.environ.copy()
+    # Setup runs outside .venv: uv-managed Python on Windows, system Python
+    # on Linux, or the validated Python/Tk framework on macOS.
+    environment.pop("VIRTUAL_ENV", None)
+    environment["UV_PROJECT_ENVIRONMENT"] = str(ENVIRONMENT_ROOT)
+    subprocess.run(command, cwd=PROJECT_ROOT, env=environment, check=True)
+
+
+def check_python(python: str, *, macos: bool, required_minor: str | None = None) -> None:
+    # Windows and macOS standardize on Python 3.12; Linux permits 3.10-3.12.
+    required = required_minor or ("3.12" if macos or sys.platform == "win32" else None)
+    check_python_runtime(python, required)
+
+
+def select_python(requested: str | None, profile: str) -> str:
+    required_minor = PROFILES[profile].python_minor
+    if sys.platform in ("darwin", "win32"):
+        required_minor = "3.12"
+    return select_python_runtime(requested, venv_python(), required_minor)
+
+
+def _ready_marker_profile() -> str | None:
+    try:
+        payload = json.loads(READY_MARKER.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return None
+    profile = payload.get("profile") if isinstance(payload, dict) else None
+    return profile if isinstance(profile, str) else None
+
+
+def remove_environment_root(root: Path) -> None:
+    """Delete the managed environment directory, tolerating stuck files.
+
+    On external and FUSE mounts a deleted-but-still-open file leaves a
+    hidden entry behind, so the plain removal fails with "Directory not
+    empty". When that happens the directory is moved aside instead, so the
+    setup can continue with a clean environment root.
+    """
+    try:
+        shutil.rmtree(root)
+        return
+    except OSError as exc:
+        print(f"[FBQ] Could not delete {root} ({exc}); moving it aside.", flush=True)
+    aside = root.with_name(f"{root.name}.old-{os.getpid()}")
+    try:
+        os.replace(root, aside)
+    except OSError as exc:
+        raise RuntimeError(
+            f"Cannot remove the environment directory {root}: {exc}. "
+            f"Move it away by hand, or point FBQ_VENV at a writable location."
+        ) from exc
+    print(f"[FBQ] Previous environment moved to {aside}", flush=True)
+
+
+def prepare_profile_environment(
+    profile: str, python: str, previous_profile: str | None = None,
+) -> None:
+    """Rebuild the managed .venv only if the base Python or accelerator changes."""
+    if ENVIRONMENT_ROOT != PROJECT_ROOT / ".venv":
+        return
+    if previous_profile is None:
+        previous_profile = _ready_marker_profile()
+    current = PROFILES[profile]
+    # A broken interpreter symlink (e.g. a deleted uv temporary build) needs
+    # a clean recreation even when the accelerator profile has not changed.
+    rebuild = bool(ENVIRONMENT_ROOT.exists() and not venv_python().is_file())
+    rebuild = rebuild or bool(
+        previous_profile is None and current.install_dependencies and venv_python().exists()
+    )
+    if previous_profile is not None and previous_profile != profile:
+        previous = PROFILES.get(previous_profile)
+        rebuild = rebuild or bool(
+            (previous and previous.install_dependencies) or current.install_dependencies
+        )
+    if not rebuild and venv_python().is_file():
+        try:
+            running_base = python_base_executable(str(venv_python()))
+            selected_base = python_base_executable(python)
+            running_minor = subprocess.check_output(
+                [str(venv_python()), "-c",
+                 "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')"],
+                text=True,
+            ).strip()
+            required_minor = current.python_minor or (
+                "3.12" if sys.platform in ("darwin", "win32") else None
+            )
+            rebuild = (
+                Path(running_base).resolve() != Path(selected_base).resolve()
+                or running_minor not in ("3.10", "3.11", "3.12")
+                or (required_minor is not None and running_minor != required_minor)
+            )
+        except (OSError, subprocess.CalledProcessError):
+            rebuild = True
+    if rebuild and ENVIRONMENT_ROOT.exists():
+        print(f"[FBQ] Rebuilding .venv for Python/Tk and PyTorch profile {profile}...",
+              flush=True)
+        remove_environment_root(ENVIRONMENT_ROOT)
+
+
+def ensure_linux_opencv_libgl() -> None:
+    """Install Ubuntu libgl1 only when the mandatory OpenCV library is absent."""
+    if not sys.platform.startswith("linux"):
+        return
+
+    import ctypes
+    import platform
+
+    try:
+        ctypes.CDLL("libGL.so.1")
+    except OSError as exc:
+        if platform.freedesktop_os_release().get("ID") == "ubuntu":
+            print("[FBQ] libGL.so.1 missing; installing Ubuntu libgl1...", flush=True)
+            prefix = [] if os.geteuid() == 0 else ["sudo"]
+            subprocess.run([*prefix, "apt-get", "install", "-y", "libgl1"], check=True)
+            ctypes.CDLL("libGL.so.1")
+        else:
+            raise RuntimeError(
+                f"OpenCV requires libGL.so.1: {exc}. Install your distribution's OpenGL runtime."
+            ) from exc
+
+
+def ensure_linux_tkdnd_dependencies() -> None:
+    """Report optional X11 libraries missing for TkDND, without using sudo."""
+    if not sys.platform.startswith("linux"):
+        return
+
+    import ctypes
+    import platform
+
+    required = {
+        "libX11.so.6": "libx11-6",
+        "libXcursor.so.1": "libxcursor1",
+    }
+    missing = []
+    for library, package in required.items():
+        try:
+            ctypes.CDLL(library)
+        except OSError:
+            missing.append(package)
+    if not missing:
+        return
+
+    packages = " ".join(missing)
+    if platform.freedesktop_os_release().get("ID") == "ubuntu":
+        guidance = f"Install optional Ubuntu packages: {packages}"
+    else:
+        guidance = f"Install X11 libraries providing: {packages}"
+    print(
+        f"[FBQ] TkDND: {guidance}. "
+        "Drag and drop may be unavailable until they are installed; "
+        "no administrator privileges will be requested.",
+        file=sys.stderr,
+        flush=True,
+    )
+
+
+def verify_gui_environment() -> None:
+    """Exercise CustomTkinter dropdowns under the supported Tk runtime."""
+    code = """
+import sys
+import tkinter as tk
+import customtkinter as ctk
+import cv2
+import av
+from gui.tk_compat import apply_tk_compatibility
+apply_tk_compatibility()
+print('[FBQ] Python:', sys.version, sys.executable)
+print('[FBQ] Tcl/Tk:', tk.TclVersion, tk.TkVersion)
+print('[FBQ] PyAV:', av.__version__)
+if sys.platform == 'darwin' and (tk.TclVersion != 8.6 or tk.TkVersion != 8.6):
+    raise RuntimeError('macOS requires Tcl/Tk 8.6 with CustomTkinter 5.2.2')
+app = ctk.CTk()
+app.withdraw()
+if sys.platform.startswith('linux'):
+    version = str(app.tk.call('info', 'patchlevel'))
+    fontsystem = str(app.tk.call('tk::pkgconfig', 'get', 'fontsystem'))
+    print('[FBQ] Tk:', version, 'fontsystem:', fontsystem)
+    if not version.startswith('8.6.') or fontsystem != 'xft':
+        raise RuntimeError('Linux requires Tk 8.6 with Xft')
+try:
+    combo = ctk.CTkComboBox(app, values=['Color', 'Grayscale'])
+    combo.pack()
+    combo.configure(values=['Grayscale', 'Color'])
+    option = ctk.CTkOptionMenu(app, values=['A', 'B'])
+    option.pack()
+    app.update()
+    print('[FBQ] CustomTkinter dropdown verification: OK')
+finally:
+    app.destroy()
+"""
+    subprocess.run([str(venv_python()), "-c", code], cwd=PROJECT_ROOT, check=True)
+
+
+def prepare_ffmpeg() -> None:
+    """Install and verify the one pinned FFmpeg used by every video feature."""
+    print("[FBQ] Preparing the pinned FFmpeg build (one-time setup)...", flush=True)
+    code = """
+from tools.ffmpeg_runtime import ensure_ffmpeg, ffmpeg_build_identity
+try:
+    executable = ensure_ffmpeg()
+except Exception as exc:
+    raise SystemExit(f"[ERROR] Could not prepare FBQ FFmpeg: {exc}") from exc
+print(f"[FBQ] FFmpeg ready ({ffmpeg_build_identity()}): {executable}", flush=True)
+"""
+    subprocess.run([str(venv_python()), "-c", code], cwd=PROJECT_ROOT, check=True)
+
+
+def verify_numeric_stack() -> None:
+    """Verify the NumPy/SciPy versions and SciPy binary compatibility."""
+    python = venv_python()
+    code = f'''
+import numpy
+import scipy
+from scipy.ndimage import gaussian_filter1d
+
+print("[FBQ] NumPy:", numpy.__version__)
+print("[FBQ] SciPy:", scipy.__version__)
+
+if numpy.__version__ != {NUMPY_VERSION!r}:
+    raise RuntimeError(f"Expected NumPy {NUMPY_VERSION}, found {{numpy.__version__}}")
+if scipy.__version__ != {SCIPY_VERSION!r}:
+    raise RuntimeError(f"Expected SciPy {SCIPY_VERSION}, found {{scipy.__version__}}")
+
+x = numpy.asarray([0.0, 1.0, 0.0], dtype=numpy.float64)
+y = gaussian_filter1d(x, 1.0)
+if y.shape != x.shape or not numpy.isfinite(y).all():
+    raise RuntimeError("SciPy ndimage verification returned an unexpected result")
+
+print("[FBQ] NumPy/SciPy binary compatibility: OK")
+'''
+    result = subprocess.run([str(python), "-c", code], cwd=PROJECT_ROOT, check=False)
+    if result.returncode:
+        raise RuntimeError("NumPy/SciPy environment verification failed")
+
+
+def verify_pytorch_profile(profile: str) -> None:
+    """Verify the selected wheel build and accelerator computation/NMS when required."""
+    check_support(profile)
+    code = f"""
+import sys
+if not (3, 10) <= sys.version_info[:2] <= (3, 12):
+    raise RuntimeError('FBQ requires Python 3.10-3.12')
+import torch
+import torchvision
+from tools.runtime_profiles import verify_execution
+from main.compute_backend import detect_backend
+verify_execution({profile!r}, torch, torchvision)
+print("[FBQ] PyTorch:", torch.__version__, "torchvision:", torchvision.__version__)
+print("[FBQ] Runtime backend:", detect_backend().value)
+print("[FBQ] PyTorch profile verification: OK")
+"""
+    result = subprocess.run(
+        [str(venv_python()), "-c", code],
+        cwd=PROJECT_ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+        errors="replace",
+    )
+    if result.stdout:
+        print(result.stdout, end="" if result.stdout.endswith("\n") else "\n")
+    if result.returncode:
+        detail = (result.stderr or result.stdout or "").strip()
+        if len(detail) > 3000:
+            detail = detail[-3000:]
+        lines = ["PyTorch/torchvision environment verification failed."]
+        if profile in {"cu132", "cu126"}:
+            lines.append(_nvidia_driver_diagnostic())
+            capability = _nvidia_compute_capability()
+            if capability is not None:
+                lines.append(
+                    f"NVIDIA GPU0 compute capability: {capability[0]}.{capability[1]}."
+                )
+            if profile == "cu132":
+                lines.append(
+                    "CUDA 13.2 is the primary profile for Turing (CC 7.5) and newer GPUs "
+                    "with a CUDA 13-compatible NVIDIA driver, and is required for Blackwell."
+                )
+            else:
+                lines.append(
+                    "CUDA 12.6 with PyTorch 2.14 is retained for Maxwell, Pascal and Volta, "
+                    "and for Turing through Hopper when their driver cannot run CUDA 13.x. "
+                    "It does not provide Blackwell sm_100/sm_120 kernels."
+                )
+        elif profile in {"rocm100", "rocmwin100"}:
+            lines.append(
+                "The AMD ROCm 10.0 profile requires supported AMD hardware and a compatible "
+                "driver/runtime. FBQ verifies real GPU computation and torchvision NMS "
+                "before accepting it."
+            )
+        elif profile == "rocm72":
+            lines.append(
+                "The ROCm 7.2 compatibility profile requires a supported Linux AMD GPU and "
+                "driver. Real GPU computation and torchvision NMS must both pass."
+            )
+        if detail:
+            lines.append("Verifier output:\n" + detail)
+        raise RuntimeError("\n".join(lines))
+
+
+def install_exact_pytorch_profile(uv_executable: str, profile: str) -> None:
+    """Install the exact torch/torchvision pair required by the selected profile."""
+    python = venv_python()
+
+    check_support(profile)
+    selected = PROFILES[profile]
+    suffix = f"+{selected.suffix}" if selected.suffix and sys.platform != "darwin" else ""
+    package_extra = f"[{selected.package_extra}]" if selected.package_extra else ""
+    torch_spec = f"torch{package_extra}=={selected.torch_version}{suffix}"
+    torchvision_spec = f"torchvision{package_extra}=={selected.torchvision_version}{suffix}"
+    index = selected.index if sys.platform != "darwin" else None
+
+    if sys.platform.startswith("linux"):
+        import platform
+
+        if platform.machine() in ("aarch64", "arm64"):
+            torchvision_spec = f"torchvision=={selected.torchvision_version}"
+
+    command = [
+        uv_executable,
+        "pip",
+        "install",
+        "--python",
+        str(python),
+    ]
+    if selected.install_dependencies:
+        # CUDA 13.2 and ROCm 10.0 require runtime packages supplied by their
+        # accelerator indexes, so allow those dependencies to be installed.
+        pass
+    else:
+        command.extend(["--reinstall", "--no-deps"])
+    if index:
+        command.extend(["--index", index])
+    else:
+        command.extend(["--default-index", "https://pypi.org/simple"])
+    command.extend([torch_spec, torchvision_spec])
+
+    dependency_note = (
+        " with accelerator runtime dependencies"
+        if selected.install_dependencies
+        else " without changing other dependencies"
+    )
+    print(
+        f"[FBQ] Installing exact PyTorch pair{dependency_note}: "
+        f"{torch_spec}, {torchvision_spec}",
+        flush=True,
+    )
+    subprocess.run(command, cwd=PROJECT_ROOT, check=True)
+
+
+def ensure_pytorch_profile(uv_executable: str, profile: str) -> None:
+    """Keep a valid existing pair; repair the selected accelerator profile when necessary."""
+    try:
+        verify_pytorch_profile(profile)
+        return
+    except RuntimeError:
+        print(
+            "[FBQ] PyTorch/torchvision profile is missing or incorrect; repairing the accelerator profile...",
+            flush=True,
+        )
+
+    install_exact_pytorch_profile(uv_executable, profile)
+    verify_pytorch_profile(profile)
+
+
+def _broadcast_windows_environment_change() -> None:
+    import ctypes
+
+    result = ctypes.c_size_t()
+    ctypes.windll.user32.SendMessageTimeoutW(
+        0xFFFF,  # HWND_BROADCAST
+        0x001A,  # WM_SETTINGCHANGE
+        0,
+        "Environment",
+        0x0002,  # SMTO_ABORTIFHUNG
+        5000,
+        ctypes.byref(result),
+    )
+
+
+def _add_to_windows_user_path(directory: Path) -> None:
+    import winreg
+
+    with winreg.CreateKeyEx(
+        winreg.HKEY_CURRENT_USER,
+        "Environment",
+        0,
+        winreg.KEY_READ | winreg.KEY_SET_VALUE,
+    ) as key:
+        try:
+            current, value_type = winreg.QueryValueEx(key, "Path")
+        except FileNotFoundError:
+            current, value_type = "", winreg.REG_EXPAND_SZ
+
+        target = os.path.normcase(os.path.abspath(str(directory)))
+        entries = [entry.strip() for entry in str(current).split(";") if entry.strip()]
+        normalized = {
+            os.path.normcase(os.path.abspath(os.path.expandvars(entry))) for entry in entries
+        }
+        if target not in normalized:
+            entries.append(str(directory))
+            winreg.SetValueEx(key, "Path", 0, value_type, ";".join(entries) + ";")
+            _broadcast_windows_environment_change()
+
+
+def install_fbq_command() -> Path:
+    """Install small per-user commands that start this checkout's environment.
+
+    Two names are installed side by side -- "fbq" and the short alias
+    "fq" -- so either one launches FBQ from any terminal. The alias is
+    a thin forwarder to the primary command, not a copy of its logic.
+    """
+    if os.name == "nt":
+        local_app_data = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
+        command_dir = local_app_data / "FBQ" / "bin"
+        command_dir.mkdir(parents=True, exist_ok=True)
+        project_root = str(PROJECT_ROOT).replace("%", "%%")
+        command_path = command_dir / "fbq.cmd"
+        command_path.write_text(
+            "@echo off\n"
+            'set "FBQ_LAUNCH_CWD=%CD%"\n'
+            f'set "FBQ_ROOT={project_root}"\n'
+            'if not exist "%FBQ_ROOT%\\.venv\\Scripts\\activate.bat" (\n'
+            "    echo [ERROR] FBQ is not installed at %FBQ_ROOT%.\n"
+            "    echo Run FBQ.bat in the FBQ folder to repair the installation.\n"
+            "    exit /b 1\n"
+            ")\n"
+            'cd /d "%FBQ_ROOT%"\n'
+            'call "%FBQ_ROOT%\\.venv\\Scripts\\activate.bat"\n'
+            "if errorlevel 1 exit /b 1\n"
+            'echo [FBQ] Location: %FBQ_ROOT%\n'
+            'set "FBQ_SPLASH_TOKEN=%RANDOM%%RANDOM%%RANDOM%"\n'
+            'start "FBQ Splash" /min "%FBQ_ROOT%\\.venv\\Scripts\\python.exe" "%FBQ_ROOT%\\gui\\splash_standalone.py" "%FBQ_SPLASH_TOKEN%" "4"\n'
+            '"%FBQ_ROOT%\\.venv\\Scripts\\fbq.exe" %*\n'
+            'set "FBQ_GUI_EXIT=%ERRORLEVEL%"\n'
+            'if "%FBQ_GUI_EXIT%"=="42" (\n'
+            '    cd /d "%FBQ_LAUNCH_CWD%"\n'
+            "    echo [FBQ] Update accepted. The updater will restart FBQ automatically.\n"
+            "    exit /b 0\n"
+            ")\n"
+            'if "%FBQ_GUI_EXIT%"=="43" (\n'
+            '    call "%FBQ_ROOT%\\.venv\\Scripts\\deactivate.bat"\n'
+            '    cd /d "%USERPROFILE%"\n'
+            "    echo [FBQ] Uninstall accepted. A separate Command Prompt will remove FBQ.\n"
+            "    exit /b 0\n"
+            ")\n"
+            'if not "%FBQ_GUI_EXIT%"=="0" exit /b %FBQ_GUI_EXIT%\n'
+            "echo [FBQ] The GUI has closed. The FBQ virtual environment is active.\n"
+            'echo [FBQ] Type "fbq" or "fq" for the home GUI.\n',
+            encoding="utf-8",
+        )
+        alias_target = str(command_path).replace("%", "%%")
+        alias_path = command_dir / "fq.cmd"
+        alias_path.write_text(
+            f'@echo off\ncall "{alias_target}" %*\nexit /b %errorlevel%\n', encoding="utf-8"
+        )
+        _add_to_windows_user_path(command_dir)
+        return command_path
+
+    command_dir = Path.home() / ".local" / "bin"
+    command_dir.mkdir(parents=True, exist_ok=True)
+    command_path = command_dir / "fbq"
+    command_path.write_text(
+        "#!/usr/bin/env sh\n"
+        f"cd {shlex.quote(str(PROJECT_ROOT))}\n"
+        'echo "[FBQ] Location: $PWD"\n'
+        f"{shlex.quote(str(ENVIRONMENT_ROOT / 'bin' / 'fbq'))} \"$@\"\n"
+        "status=$?\n"
+        "if [ \"$status\" -eq 42 ] || [ \"$status\" -eq 43 ]; then\n"
+        "    exit 0\n"
+        "fi\n"
+        "exit \"$status\"\n",
+        encoding="utf-8",
+    )
+    command_path.chmod(0o755)
+
+    alias_path = command_dir / "fq"
+    alias_path.write_text(
+        f"#!/usr/bin/env sh\nexec {shlex.quote(str(command_path))} \"$@\"\n",
+        encoding="utf-8",
+    )
+    alias_path.chmod(0o755)
+    return command_path
+
+
+def required_uv_version() -> str:
+    """Return the exact uv version pinned in pyproject.toml."""
+    try:
+        lines = PYPROJECT_FILE.read_text(encoding="utf-8").splitlines()
+    except OSError as exc:
+        raise RuntimeError(f"Could not read {PYPROJECT_FILE}: {exc}") from exc
+
+    in_tool_uv = False
+    for raw_line in lines:
+        line = raw_line.strip()
+        if line.startswith("[") and line.endswith("]"):
+            in_tool_uv = line == "[tool.uv]"
+            continue
+        if not in_tool_uv:
+            continue
+        key, separator, value = line.partition("=")
+        if key.strip() != "required-version" or not separator:
+            continue
+        specifier = value.strip()
+        if not (specifier.startswith('"==') and specifier.endswith('"')):
+            break
+        version = specifier[3:-1].strip()
+        if version:
+            return version
+        break
+
+    raise RuntimeError(
+        "[tool.uv].required-version in pyproject.toml must be an exact == version pin."
+    )
+
+
+def uv_version(uv_executable: str) -> str:
+    """Return the version an uv executable reports, or "" if it cannot be asked."""
+    try:
+        completed = subprocess.run(
+            [uv_executable, "--version"],
+            capture_output=True,
+            text=True,
+            errors="replace",
+            check=False,
+        )
+    except OSError:
+        return ""
+    if completed.returncode != 0:
+        return ""
+    # "uv 1.2.3 (abc1234 2026-01-01)" -> "1.2.3"
+    fields = (completed.stdout or "").strip().splitlines()
+    fields = fields[0].split() if fields else []
+    return fields[1] if len(fields) >= 2 else ""
+
+
+def check_uv_version(uv_executable: str) -> str:
+    """Refuse to sync with a uv other than the pinned one."""
+    required = required_uv_version()
+    found = uv_version(uv_executable)
+    if found == required:
+        return required
+    reported = found or "no version"
+    raise RuntimeError(
+        f"FBQ is pinned to uv {required}, but {uv_executable} reports {reported}.\n"
+        "Run the FBQ launcher (FBQ.bat, FBQ.command or FBQ.sh) instead "
+        "of calling this script directly: it installs the pinned uv into the FBQ "
+        "folder without touching any uv you already have."
+    )
+
+
+def _accelerator_selection_identity() -> dict:
+    profiles, _ = select_torch_profiles()
+    identity: dict[str, object] = {"candidates": profiles}
+
+    nvidia = query_nvidia_driver_info()
+    if nvidia is not None:
+        name, driver, _ = nvidia
+        identity["nvidia"] = {
+            "name": name,
+            "driver": driver,
+            "compute_capability": _nvidia_compute_capability(),
+        }
+        return identity
+
+    windows_amd = _windows_amd_identity()
+    if windows_amd is not None:
+        identity["windows_amd"] = windows_amd
+        return identity
+
+    if amd_runtime_candidate():
+        devices = []
+        for device in sorted(Path("/sys/class/drm").glob("card*/device")):
+            values = []
+            for field in ("vendor", "device", "revision"):
+                try:
+                    values.append((device / field).read_text().strip())
+                except OSError:
+                    values.append("")
+            if values[0].lower() == "0x1002":
+                devices.append(values)
+        try:
+            driver_version = Path("/sys/module/amdgpu/version").read_text().strip()
+        except OSError:
+            driver_version = ""
+        identity["linux_amd"] = {
+            "devices": devices,
+            "driver": driver_version,
+        }
+
+    return identity
+
+
+def ready_identity(profile: str) -> dict:
+    inputs = ("pyproject.toml", "uv.lock", "VERSION", "tools/setup_environment.py",
+              "tools/runtime_profiles.py", "tools/python_runtime.py",
+              "tools/project_meta.py", "main/compute_backend.py", "gui/tk_compat.py")
+    digest = hashlib.sha256()
+    for name in inputs:
+        digest.update((PROJECT_ROOT / name).read_bytes())
+    return {
+        "schema": 2,
+        "profile": profile,
+        "selection": _accelerator_selection_identity(),
+        "inputs": digest.hexdigest(),
+    }
+
+
+def environment_ready() -> bool:
+    """Legacy empty markers are invalid. Verify installed wheels on every fast path."""
+    try:
+        profiles, _ = select_torch_profiles()
+        marker = json.loads(READY_MARKER.read_text())
+        profile = marker.get("profile") if isinstance(marker, dict) else None
+        if profile not in profiles:
+            return False
+        if marker != ready_identity(profile):
+            return False
+        verify_pytorch_profile(profile)
+        check_python(str(venv_python()), macos=sys.platform == "darwin",
+                     required_minor=PROFILES[profile].python_minor)
+        return True
+    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError):
+        return False
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--check-ready", action="store_true")
+    parser.add_argument("--uv", help="Path to the uv executable.")
+    parser.add_argument("--python", default=os.environ.get("FBQ_PYTHON"),
+                        help="Python executable used to create the application environment.")
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+    if args.check_ready:
+        return 0 if environment_ready() else 1
+    if not args.uv:
+        raise RuntimeError("--uv is required for setup")
+    profiles, explanation = select_torch_profiles()
+    print("[FBQ] Preparing the Python environment...", flush=True)
+    print(f"[FBQ] PyTorch profile selection: {explanation}", flush=True)
+
+    try:
+        if os.name == "nt" and ENVIRONMENT_ROOT != PROJECT_ROOT / ".venv":
+            raise RuntimeError("FBQ_VENV is supported by the macOS/Linux launcher only.")
+        previous_profile = _ready_marker_profile()
+        # FBQ.bat uses this marker for its fast path. Remove it before making
+        # any changes so an interrupted or failed setup is fully checked next time.
+        READY_MARKER.unlink(missing_ok=True)
+        check_uv_version(args.uv)
+        ensure_linux_opencv_libgl()
+        ensure_linux_tkdnd_dependencies()
+
+        profile = ""
+        last_error: Exception | None = None
+        for index, candidate in enumerate(profiles):
+            try:
+                if index:
+                    print(
+                        f"[FBQ] Trying compatibility profile {candidate}...",
+                        flush=True,
+                    )
+                python = select_python(args.python, candidate)
+                prepare_profile_environment(candidate, python, previous_profile)
+                sync_environment(args.uv, candidate, python)
+                verify_numeric_stack()
+                ensure_pytorch_profile(args.uv, candidate)
+                # Re-check after any PyTorch repair to ensure no unrelated package changed.
+                verify_numeric_stack()
+                profile = candidate
+                break
+            except (OSError, subprocess.CalledProcessError, RuntimeError) as exc:
+                last_error = exc
+                if index + 1 >= len(profiles):
+                    raise
+                print(
+                    f"[FBQ] PyTorch profile {candidate} was not usable: {exc}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                print(
+                    f"[FBQ] Falling back to {profiles[index + 1]}.",
+                    flush=True,
+                )
+                previous_profile = candidate
+
+        if not profile:
+            raise RuntimeError(f"No usable PyTorch profile was found: {last_error}")
+
+        verify_gui_environment()
+        prepare_ffmpeg()
+        install_fbq_command()
+        # This must be executable after setup exits, with no ephemeral
+        # Python directory in its shebang or interpreter symlink.
+        if not venv_python().is_file():
+            raise RuntimeError("FBQ .venv Python is missing or points to a deleted interpreter.")
+        from tools.python_runtime import stable_base_python
+        stable_base_python(str(venv_python()))
+        subprocess.run([str(venv_python()), "-c",
+                        "import sys; assert sys.prefix != sys.base_prefix"], check=True)
+        READY_MARKER.write_text(json.dumps(ready_identity(profile)), encoding="utf-8")
+    except (OSError, subprocess.CalledProcessError, RuntimeError) as exc:
+        print(f"[ERROR] {exc}", file=sys.stderr)
+        signal_stop()
+        return getattr(exc, "returncode", 1) or 1
+
+    print("[FBQ] Environment ready.", flush=True)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

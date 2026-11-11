@@ -1,0 +1,5461 @@
+# Copyright (C) 2026 Yusuke Notomi
+# SPDX-License-Identifier: AGPL-3.0-only
+
+import codecs
+import csv
+import glob
+import json
+import math
+import os
+import re
+import sys
+import copy
+import argparse
+import queue
+import subprocess
+import tempfile
+import threading
+import time
+import traceback
+import tkinter as tk
+from tkinter import filedialog, messagebox
+
+import customtkinter as ctk
+import psutil
+import yaml
+
+try:
+    from .project_paths import (
+        GUI_DIR,
+        PROJECT_ROOT,
+        MAIN_DIR as MAIN_PATH,
+        gui_asset,
+        gui_script,
+        main_script,
+        open_results_directory,
+        with_pythonpath,
+    )
+    from .window_icon import configure_dpi_scaling, configure_taskbar_identity, install_window_icon
+    from .dark_widgets import dark_spinbox
+    from .ui_theme import SPIN_STYLE, apply_theme
+    from .config_path_recovery import prepare_config_for_gui
+    from .canvas_file_drop import install_canvas_file_drop
+    from .attention_border import RotatingBorderHighlight
+    from .save_shortcut import bind_save_shortcut
+    from .video_input import (
+        VIDEO_DROP_SUFFIXES,
+        ask_open_analysis_video,
+        ask_open_analysis_videos,
+        prepare_analysis_video,
+    )
+except ImportError:  # Preserve direct execution with: python gui/gui_easy_tracking.py
+    from project_paths import (
+        GUI_DIR,
+        PROJECT_ROOT,
+        MAIN_DIR as MAIN_PATH,
+        gui_asset,
+        gui_script,
+        main_script,
+        open_results_directory,
+        with_pythonpath,
+    )
+    from window_icon import configure_dpi_scaling, configure_taskbar_identity, install_window_icon
+    from dark_widgets import dark_spinbox
+    from ui_theme import SPIN_STYLE, apply_theme
+    from config_path_recovery import prepare_config_for_gui
+    from canvas_file_drop import install_canvas_file_drop
+    from attention_border import RotatingBorderHighlight
+    from save_shortcut import bind_save_shortcut
+    from video_input import (
+        VIDEO_DROP_SUFFIXES,
+        ask_open_analysis_video,
+        ask_open_analysis_videos,
+        prepare_analysis_video,
+    )
+
+# Matches tqdm lines: anything containing "N/TOTAL [" (works for both TTY and non-TTY output)
+_TQDM_PAT = re.compile(r'(\d+)/(\d+)\s*\[')
+# Strips ANSI color/cursor escape codes (e.g. tqdm's colour="green") from subprocess output.
+_ANSI_ESCAPE_RE = re.compile(r'\x1b\[[0-9;]*[A-Za-z]')
+
+
+def _simplify_progress_line(line: str) -> str:
+    """Reduce one cleaned subprocess output line to a short plain-text status."""
+    match = _TQDM_PAT.search(line)
+    if match:
+        n, total = match.group(1), match.group(2)
+        desc_m = re.search(r"\s(\d+)%\|", line)
+        desc = ""
+        if desc_m:
+            prefix = line[:desc_m.start()]
+            colon = prefix.rfind(":")
+            desc = prefix[:colon].strip() if colon >= 0 else prefix.strip()
+        return f"{desc} {n}/{total}" if desc else f"{n}/{total}"
+    if line.startswith("[initial_tracking]"):
+        line = line[len("[initial_tracking]"):].strip()
+    return line
+# Matches YOLO training tqdm desc: "3/50  3.05G  0.8756  0.7188  1.492 ..."
+_YOLO_NUMBER = r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?"
+_YOLO_LOSS_PAT = re.compile(
+    rf"\d+/\d+\s+{_YOLO_NUMBER}G?\s+({_YOLO_NUMBER})(?=\s|$)"
+)
+# Precise epoch image counts and effective batch sizes are emitted by FBQ.
+_TRAIN_EPOCH_META_PAT = re.compile(
+    r"^\[FBQ TRAIN EPOCH\] epoch=(\d+)/(\d+) images=(\d+) batch=(\d+)$"
+)
+# The whole row Ultralytics' DetectionTrainer.progress_string() prints:
+# epoch, GPU memory, box/cls/dfl loss, instances, image size. Matching all of it
+# is what tells a training epoch apart from every other tqdm bar (dataset
+# scanning, validation, the non-YOLO steps), which keep their existing display.
+_YOLO_TRAIN_DESC_PAT = re.compile(
+    rf'^(\d+)/(\d+)\s+({_YOLO_NUMBER})G\s+\S+\s+\S+\s+\S+\s+\d+\s+(\d+)$'
+)
+# Field separator in the training status line; wide enough to read at a glance.
+_TRAIN_FIELD_GAP = "   "
+
+# Keep all Visual Progress text close to the size of the Easy Tracking controls.
+_VISUAL_PROGRESS_FONT_SIZE = 13
+_VISUAL_PROGRESS_FONT = ("TkDefaultFont", _VISUAL_PROGRESS_FONT_SIZE)
+_VISUAL_PROGRESS_TITLE_FONT = ("TkDefaultFont", _VISUAL_PROGRESS_FONT_SIZE, "bold")
+
+try:
+    import cv2
+    _HAS_CV2 = True
+except ImportError:
+    _HAS_CV2 = False
+
+CURRENT_DIR = str(GUI_DIR)
+MAIN_DIR = str(MAIN_PATH)
+BATCH_SCRIPT = str(main_script("batch.py"))
+
+if MAIN_DIR not in sys.path:
+    sys.path.insert(0, MAIN_DIR)
+from compute_telemetry import query_nvidia_smi_index_with_temperature
+from experiment_utils import DEFAULT_LR0, DEFAULT_LRF
+from path_utils import relativize_config_paths
+from roi import (
+    POPULATION_CROWDED as _POPULATION_CROWDED,
+    POPULATION_ESTIMATED as _POPULATION_ESTIMATED,
+    POPULATION_FIXED as _POPULATION_FIXED,
+    load_roi_settings,
+    normalize_population_mode,
+    roi_population_model,
+)
+from segmentation_metadata import (
+    read_segmentation_metadata,
+    segmentation_paths_for_session,
+)
+from training_paths import OUTPUT_ROOT_DIR, TRAINING_STAGE_DIRS
+from tracking_constants import DEFAULT_INTERACT_IOU
+
+apply_theme()
+
+_SPIN_CFG = dict(SPIN_STYLE)
+
+
+def _normalized_roi_points(points, image_shape) -> list[list[float]]:
+    """Return the corners of a ROI in the normalized coordinates of the frame.
+
+    The segmentation step stores its ROIs in pixels; the analysis works in
+    normalized coordinates, so the geometry is converted here instead of being
+    lost on the way.
+    """
+    if not points or not image_shape:
+        return []
+    height, width = int(image_shape[0]), int(image_shape[1])
+    if height <= 0 or width <= 0:
+        return []
+    normalized: list[list[float]] = []
+    for point in points:
+        if len(point) < 2:
+            continue
+        x = float(point[0]) / max(width - 1, 1)
+        y = float(point[1]) / max(height - 1, 1)
+        normalized.append([min(max(x, 0.0), 1.0), min(max(y, 0.0), 1.0)])
+    return normalized
+
+
+def _arena_id(name: str, index: int) -> str:
+    """Return the identifier of an arena: a short, unique and stable name."""
+    cleaned = re.sub(r"[^A-Za-z0-9_-]+", "_", str(name or "").strip()).strip("_-")
+    if not cleaned:
+        cleaned = f"arena{index + 1}"
+    return cleaned.lower()[:40]
+
+
+def _roi_rectangle_text(points) -> str:
+    """Return the bounding rectangle of a polygon as editable text."""
+    values = [point for point in (points or []) if len(point) >= 2]
+    if not values:
+        return "0 0 1 1"
+    xs = [float(point[0]) for point in values]
+    ys = [float(point[1]) for point in values]
+    return " ".join(
+        f"{value:.4g}" for value in (min(xs), min(ys), max(xs), max(ys))
+    )
+
+# Process steps: (display_label, skip_key, script_stem)
+def _start_maximized(window: tk.Tk) -> None:
+    def maximize() -> None:
+        if sys.platform == "darwin":
+            try:
+                window.attributes("-fullscreen", True)
+                window.update_idletasks()
+                return
+            except Exception:
+                pass
+
+        try:
+            window.state("zoomed")
+            window.update_idletasks()
+            if str(window.state()) == "zoomed":
+                return
+        except Exception:
+            pass
+
+        try:
+            window.attributes("-zoomed", True)
+            window.update_idletasks()
+            return
+        except Exception:
+            pass
+
+        try:
+            screen_w = window.winfo_screenwidth()
+            screen_h = window.winfo_screenheight()
+            window.geometry(f"{screen_w}x{screen_h}+0+0")
+        except Exception:
+            pass
+
+    maximize()
+    for delay_ms in (50, 250, 1000):
+        window.after(delay_ms, maximize)
+
+
+def _safe_stdout_write(data: str) -> None:
+    try:
+        sys.stdout.write(data)
+    except UnicodeEncodeError:
+        encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
+        safe = data.encode(encoding, errors="replace").decode(encoding, errors="replace")
+        sys.stdout.write(safe)
+
+
+def _stdout_supports_overwrite() -> bool:
+    try:
+        return bool(sys.stdout.isatty())
+    except Exception:
+        return False
+
+
+STEPS = [
+    ("Initial\nTracking",    "skip_initial_tracking",              "initial_tracking"),
+    ("Direction\nEstimation","skip_trajectory_direction_filtering", "direction_class_assignment"),
+    ("Refine\nBlobs",        "skip_refine_blobs_through_tracking",  "direction_class_filtering"),
+    ("Clustered\nPaste",     "skip_paste_blobs_clustered",          "interaction_image_synthesis_clustered"),
+    ("Mixed\nPaste",         "skip_paste_blobs_with_crossing",      "interaction_image_synthesis"),
+    ("Crop\nImages",         "skip_cropping",                       "crop_images"),
+    ("Create\nDataset",      "skip_creating_direction_dataset",     "create_dataset"),
+    ("Training",             "skip_training",                       "obb_detector_training"),
+    ("Detection",            "skip_detection",                      "obb_detection"),
+    ("ID\nTracking",         "skip_id_tracking",                    "multi_staged_association"),
+    ("Refinement",             "skip_refinement",                  "refinement"),
+    ("Create\nVideo",        "skip_creating_video",                 "create_video"),
+]
+SCRIPT_TO_IDX: dict[str, int] = {s[2]: i for i, s in enumerate(STEPS)}
+
+_C_INACTIVE  = "#1C242A"
+_C_RUNNING   = "#3B82F6"
+_C_DONE      = "#155a2e"
+_C_SELECTED  = _C_INACTIVE
+_C_DISABLED  = "#252525"
+_C_BG_ROW    = "#1e1e1e"
+_WIDTH_SCALE_MIN = 0.9
+_WIDTH_SCALE_MAX = 1.1
+# Directory mode accepts every suffix supported by the normal video picker.
+# Each top-level file is passed through the same compatibility preparation path.
+
+
+class EasyTrackingGUI(ctk.CTk):
+
+    def __init__(self) -> None:
+        super().__init__()
+        configure_dpi_scaling(self)
+        install_window_icon(self)
+        self.title("FBQ Easy Tracking")
+        self.geometry("1300x840")
+
+        self._seg_proc: subprocess.Popen | None = None
+        self._seg_poll_id: str | None = None
+        self._seg_launch_pickle_signature: tuple[int, int] | None = None
+        self._seg_handoff_path: str = ""
+        self._ui_event_queue = queue.SimpleQueue()
+        self._ui_event_poll_id: str | None = None
+        self._batch_proc: subprocess.Popen | None = None
+        self._batch_log_path: str = ""
+        self._active_config_path: str = ""
+        self._stop_requested = False
+        self._last_run_state = "idle"
+        self._workflow_segmentation_ready = False
+        self._progress_details_open = False
+        self._progress_config_loaded = False
+        self._step1_details_open = True
+        self._step2_details_open = True
+        self._action_glows: dict[str, RotatingBorderHighlight] = {}
+        self._base_cfg: dict = {}
+        self._loaded_cfg: dict = {}
+        self._loaded_config_path: str = ""
+        self._loaded_easy_answers: dict = {}
+        self._easy_answers: dict = {}
+        self._selected_training_video: str = ""
+        self._tracking_video_is_dir = tk.BooleanVar(value=False)
+        self._prepared_tracking_directory = ""
+        self._prepared_tracking_files: list[str] = []
+        self._extra_training_videos: list[str] = []
+        self._last_training_video_for_extras: str = ""
+        self._prepared_tracking_source_signature: tuple[tuple[str, int, int], ...] = ()
+        self._skip_flags: dict[str, bool] = {}
+        self._manual_skip_keys: set[str] = set()
+        self._num_confirmed = False
+        self._variable_count = tk.BooleanVar(value=False)
+        self._without_direction = tk.BooleanVar(value=False)
+        self._without_direction.trace_add(
+            "write", lambda *_: self._apply_backward_question_state())
+        self._backward_radios: list[ctk.CTkRadioButton] = []
+        self._confirmed_num_objects = 1
+        self._overlap_radios: list[ctk.CTkRadioButton] = []
+        self._single_animal_paste: tk.BooleanVar | None = None
+        self._vis_indices: list[int] = []
+        self._done_steps: set[int] = set()
+        self._active_step: int = -1
+        self._active_block_vis: int = -1
+        self._selected_block: int = -1
+        self._block_frames: list[tk.Canvas] = []
+        self._block_text_ids: list[int] = []
+        self._block_states: list[str] = []
+        self._shimmer_after_id: str | None = None
+        self._shimmer_phase: float = 0.0
+
+        # Canvas panel state
+        self._canvas_poll_id: str | None = None
+        self._display_photo = None          # keeps PIL PhotoImage from GC
+        self._display_step: int = -2        # last step rendered (-2 = none)
+        self._last_display_img: str = ""    # last successfully shown image path
+        self._canvas_content: dict = {}     # cache for resize re-render
+        self._step_start_times: dict[int, float] = {}
+        self._batch_losses: list[float] = []   # live box loss per completed batch
+        self._batch_loss_images: list[int] = []  # total images processed at each loss sample
+        self._refine_losses: list[float] = []
+        self._refine_loss_images: list[int] = []
+        self._reset_training_progress()
+        self._system_monitor_snapshot: dict[str, float | str | None] = {}
+        self._system_monitor_canvas: tk.Canvas | None = None
+        self._system_monitor_canvas_size: tuple[int, int] | None = None
+        self._system_monitor_meter_items: dict[str, dict[str, int | float | str]] = {}
+        self._system_monitor_backend_item: int | None = None
+        self._system_monitor_stop = threading.Event()
+        self._system_monitor_thread: threading.Thread | None = None
+
+        # Preview-folder shortcuts. Availability is derived from the current
+        # filesystem state so buttons follow creation, moves, and cleanup.
+        self._preview_folder_buttons: dict[str, ctk.CTkButton] = {}
+        self._preview_folder_paths: dict[str, str] = {}
+        self._preview_folder_poll_id: str | None = None
+
+        self._build_ui()
+        bind_save_shortcut(self, self._save_config)
+        self._ui_event_poll_id = self.after(50, self._drain_ui_events)
+        self._refresh_preview_folder_buttons()
+        self._set_skip_flags(self._default_skip_flags(), render=True)
+        self._sync_refine_skip_from_backward_question()
+        self._remember_easy_answers()
+        _start_maximized(self)
+
+    def _post_ui_event(self, callback, *args) -> None:
+        """Queue one GUI callback for execution by Tk's main thread."""
+        self._ui_event_queue.put((callback, args))
+
+    def _drain_ui_events(self) -> None:
+        """Run worker-thread GUI callbacks only from Tk's main thread."""
+        self._ui_event_poll_id = None
+        while True:
+            try:
+                callback, args = self._ui_event_queue.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                callback(*args)
+            except Exception:
+                traceback.print_exc()
+        try:
+            if self.winfo_exists():
+                self._ui_event_poll_id = self.after(50, self._drain_ui_events)
+        except tk.TclError:
+            self._ui_event_poll_id = None
+
+    # UI construction
+    def _build_ui(self) -> None:
+        # Resizable split layout: left controls | right preview canvas.
+        pane_padding = 8
+        pane = tk.PanedWindow(
+            self,
+            orient=tk.HORIZONTAL,
+            bg="#151C21",
+            bd=0,
+            sashwidth=7,
+            sashrelief="flat",
+            showhandle=True,
+            handlesize=14,
+            opaqueresize=True,
+        )
+        pane.pack(fill="both", expand=True, padx=pane_padding, pady=(0, 8))
+
+        left_wrap = ctk.CTkFrame(pane, corner_radius=0, width=800)
+        left_wrap.pack_propagate(False)
+
+        left_footer = ctk.CTkFrame(left_wrap, corner_radius=0)
+        left_footer.pack(side="bottom", fill="x", padx=12, pady=(0, 10))
+        config_buttons = ctk.CTkFrame(left_footer, fg_color="transparent")
+        config_buttons.pack(side="left")
+        self._load_btn = ctk.CTkButton(
+            config_buttons, text="Load Config", height=34, width=110,
+            command=self._load_config,
+        )
+        self._load_btn.pack(side="left", padx=(0, 8))
+        self._save_btn = ctk.CTkButton(
+            config_buttons, text="Save Config", height=34, width=110,
+            command=self._save_config,
+        )
+        self._save_btn.pack(side="left")
+        self._switch_btn = ctk.CTkButton(
+            left_footer, text="Switch Advanced Mode", width=180, height=34,
+            command=self._switch_advanced_mode,
+        )
+        self._switch_btn.pack(side="right")
+
+        left = ctk.CTkScrollableFrame(left_wrap, corner_radius=0)
+        self._left_controls = left
+        self._video_prompt_host = ctk.CTkFrame(left_wrap, corner_radius=0)
+        self._video_prompt_host.pack(fill="both", expand=True)
+        right = tk.Frame(pane, bg="#0D1216", width=480)
+        right.grid_propagate(False)
+
+        left_min_width, right_min_width = 540, 360
+        pane.add(left_wrap, minsize=left_min_width)
+        pane.add(right, minsize=right_min_width)
+        # The handle can occupy more space than the visible sash itself.
+        sash_width = max(int(pane.cget("sashwidth")), int(pane.cget("handlesize")))
+        self.minsize(left_min_width + right_min_width + sash_width + 2 * pane_padding, 600)
+
+        self._build_video_prompt(self._video_prompt_host)
+        video_area = ctk.CTkFrame(left, fg_color="transparent")
+        self._video_area = video_area
+        video_area.pack(fill="x")
+        self._step1_tab = ctk.CTkButton(
+            video_area, text="▸  Step 1: Select Videos", height=30,
+            fg_color="#343434", hover_color="#464646",
+            command=self._toggle_step1_details,
+            anchor="w",
+        )
+        self._build_video_section(video_area)
+        self._build_questions_section(left)
+        self._build_action_buttons(left)
+        self._build_progress_section(left)
+        self._action_glows = {
+            "enter": RotatingBorderHighlight(self, self._num_enter_button),
+            "processing": RotatingBorderHighlight(self, self._run_btn),
+            "results": RotatingBorderHighlight(self, self._open_results_btn),
+        }
+        self._build_canvas_panel(right)
+        self._video_drop_state = install_canvas_file_drop(
+            self, pane,
+            allowed_suffixes=VIDEO_DROP_SUFFIXES,
+            on_path=self._handle_dropped_training_video,
+            status_callback=lambda message: self._canvas_status.configure(text=message),
+            label="video",
+            include_descendants=True,
+        )
+        self._sync_segmentation_status_from_outputs()
+
+    def _build_video_prompt(self, parent: ctk.CTkFrame) -> None:
+        """Initial video picker, centered until a video has been selected."""
+        self._video_details_revealed = False
+        self._video_prompt = ctk.CTkFrame(
+            parent, corner_radius=12, border_width=1,
+            border_color="#505050", fg_color="#1b1b1b",
+        )
+        # Occupy almost all of the left area above the fixed footer, leaving
+        # a narrow margin. Center the controls inside this large panel.
+        self._video_prompt.pack(fill="both", expand=True, padx=20, pady=18)
+        prompt_contents = ctk.CTkFrame(self._video_prompt, fg_color="transparent")
+        prompt_contents.pack(expand=True)
+        prompt_font = ctk.CTkFont(size=21, weight="bold")
+        self._video_select_btn = ctk.CTkButton(
+            prompt_contents,
+            text="Select Videos",
+            width=260, height=52,
+            border_width=3, border_color="#777777",
+            font=prompt_font,
+            command=self._browse_training_video,
+        )
+        self._video_select_btn.pack(padx=24, pady=(0, 20))
+        ctk.CTkLabel(
+            prompt_contents,
+            text="or drag & drop a video",
+            text_color="#d0d0d0",
+            font=prompt_font,
+        ).pack()
+
+        self._video_select_phase = 0.0
+        self._video_select_last_time = time.monotonic()
+        self._video_select_hovered = False
+        self._video_select_after_id: str | None = None
+        self._video_select_border_size: tuple[int, int] | None = None
+        self._video_select_border_items = [
+            self._video_select_btn._canvas.create_line(
+                0, 0, 0, 0, width=2.6, capstyle=tk.ROUND,
+                tags="video_select_attention_border",
+            )
+            for _ in range(96)
+        ]
+        self._video_select_btn.bind("<Enter>", self._on_video_select_enter)
+        self._video_select_btn.bind("<Leave>", self._on_video_select_leave)
+        self._video_select_btn._canvas.bind(
+            "<Configure>", lambda _event: self.after_idle(self._paint_video_select_border),
+            add="+",
+        )
+        self._video_select_after_id = self.after(50, self._animate_video_select_border)
+
+    def _paint_video_select_border(self) -> None:
+        if self._video_details_revealed or not self._video_select_btn.winfo_ismapped():
+            return
+        button = self._video_select_btn
+        canvas = button._canvas
+        size = (canvas.winfo_width(), canvas.winfo_height())
+        if min(size) < 20:
+            return
+        count = len(self._video_select_border_items)
+        if size != self._video_select_border_size:
+            points = self._segmentation_border_points(
+                *size, count,
+                button._apply_widget_scaling(button.cget("corner_radius")),
+                button._apply_widget_scaling(button.cget("border_width")),
+            )
+            for i, item in enumerate(self._video_select_border_items):
+                x0, y0 = points[i]
+                x1, y1 = points[(i + 1) % count]
+                canvas.coords(item, x0, y0, x1, y1)
+            self._video_select_border_size = size
+        for i, item in enumerate(self._video_select_border_items):
+            distance = abs((i / count - self._video_select_phase + 0.5) % 1 - 0.5)
+            brightness = max(0.0, 1.0 - distance / 0.13) ** 2
+            low, high = (119, 119, 119), (250, 250, 250)
+            color = "#{:02x}{:02x}{:02x}".format(
+                *(round(a + (b - a) * brightness) for a, b in zip(low, high))
+            )
+            canvas.itemconfigure(item, fill=color)
+        canvas.tag_raise("video_select_attention_border")
+
+    def _animate_video_select_border(self) -> None:
+        self._video_select_after_id = None
+        if self._video_details_revealed or self._video_select_hovered:
+            return
+        now = time.monotonic()
+        self._video_select_phase = (
+            self._video_select_phase + (now - self._video_select_last_time) / 3.0
+        ) % 1.0
+        self._video_select_last_time = now
+        self._paint_video_select_border()
+        self._video_select_after_id = self.after(50, self._animate_video_select_border)
+
+    def _on_video_select_enter(self, _event=None) -> None:
+        if self._video_select_hovered:
+            return
+        self._video_select_hovered = True
+        if self._video_select_after_id is not None:
+            self.after_cancel(self._video_select_after_id)
+            self._video_select_after_id = None
+        self._paint_video_select_border()
+
+    def _on_video_select_leave(self, _event=None) -> None:
+        self.after(25, self._check_video_select_hover)
+
+    def _check_video_select_hover(self) -> None:
+        if self._video_details_revealed or not self._video_select_hovered:
+            return
+        button = self._video_select_btn
+        x, y = self.winfo_pointerx(), self.winfo_pointery()
+        if (button.winfo_rootx() <= x < button.winfo_rootx() + button.winfo_width()
+                and button.winfo_rooty() <= y < button.winfo_rooty() + button.winfo_height()):
+            return
+        self._video_select_hovered = False
+        self._video_select_last_time = time.monotonic()
+        self._animate_video_select_border()
+
+    def _reveal_video_details_if_selected(self) -> None:
+        if not self._video_details_revealed and self._video_entry.get().strip():
+            self._video_details_revealed = True
+            if self._video_select_after_id is not None:
+                self.after_cancel(self._video_select_after_id)
+                self._video_select_after_id = None
+            self._video_prompt_host.pack_forget()
+            self._left_controls.pack(fill="both", expand=True)
+            self._video_frame.pack(fill="x", padx=12, pady=(10, 5))
+
+    def _toggle_step1_details(self) -> None:
+        if not self._workflow_segmentation_ready:
+            return
+        self._step1_details_open = not self._step1_details_open
+        self._update_step1_layout()
+
+    def _update_step1_layout(self) -> None:
+        """Collapse finished Step 1 to a small tab; let users reopen its settings."""
+        if not self._video_details_revealed:
+            return
+        if self._workflow_segmentation_ready:
+            if not self._step1_tab.winfo_manager():
+                self._step1_tab.pack(fill="x", padx=12, pady=(8, 2))
+            self._step1_tab.configure(
+                text=("▾" if self._step1_details_open else "▸") + "  Step 1: Select Videos"
+            )
+        else:
+            self._step1_tab.pack_forget()
+        if self._step1_details_open or not self._workflow_segmentation_ready:
+            if not self._video_frame.winfo_manager():
+                self._video_frame.pack(fill="x", padx=12, pady=(10, 5))
+        else:
+            self._video_frame.pack_forget()
+
+    def _toggle_step2_details(self) -> None:
+        if not self._workflow_segmentation_ready:
+            return
+        self._step2_details_open = not self._step2_details_open
+        self._update_step2_layout(True)
+
+    def _update_step2_layout(self, visible: bool) -> None:
+        """Display Step 2 as an expandable tab; keep it open on first reveal."""
+        del visible
+        if not self._step2_tab.winfo_manager():
+            self._step2_tab.pack(
+                fill="x", padx=12, pady=(5, 2), after=self._video_area,
+            )
+        self._step2_tab.configure(
+            text=("▾" if self._step2_details_open else "▸") + "  Step 2: Settings"
+        )
+        if self._step2_details_open:
+            if not self._settings_frame.winfo_manager():
+                self._settings_frame.pack(
+                    fill="x", padx=12, pady=(2, 5), after=self._step2_tab,
+                )
+        else:
+            self._settings_frame.pack_forget()
+
+    def _toggle_progress_details(self) -> None:
+        """Collapse or expand Progress without changing tracking execution."""
+        if not self._progress_host.winfo_manager():
+            return
+        self._progress_details_open = not self._progress_details_open
+        self._update_progress_layout(True)
+
+    def _update_progress_layout(self, visible: bool) -> None:
+        """Show a collapsed Progress tab when Processing becomes available."""
+        if not visible:
+            self._progress_host.pack_forget()
+            return
+        if not self._progress_host.winfo_manager():
+            self._progress_host.pack(fill="x", padx=12, pady=(5, 14))
+        self._progress_tab.configure(
+            text=("▾" if self._progress_details_open else "▸") + "  Progress"
+        )
+        if self._progress_details_open:
+            if not self._progress_frame.winfo_manager():
+                self._progress_frame.pack(fill="x", pady=(2, 0))
+        else:
+            self._progress_frame.pack_forget()
+
+    def _results_exist(self) -> bool:
+        """Only actual tracking CSV output counts, not an empty results directory."""
+        session = self._get_session()
+        if not session:
+            return False
+        if self._without_direction.get() and os.path.basename(os.path.normpath(session)) != "without_direction_estimation":
+            session = os.path.join(session, "without_direction_estimation")
+        folder = os.path.join(session, "results")
+        if not os.path.isdir(folder):
+            return False
+        try:
+            for base, _dirs, filenames in os.walk(folder):
+                if any(name.lower().endswith(".csv") and os.path.getsize(os.path.join(base, name)) > 0
+                       for name in filenames):
+                    return True
+        except OSError:
+            return False
+        return False
+
+    def _set_post_segmentation_visibility(self, visible: bool) -> None:
+        """Display each stage only once its preceding interaction is finished."""
+        if visible and not self._workflow_segmentation_ready:
+            self._step1_details_open = False
+            self._step2_details_open = True
+        self._workflow_segmentation_ready = visible
+        self._update_step1_layout()
+        self._update_step2_layout(visible)
+
+        ready = visible and (self._num_confirmed or self._variable_count.get())
+        running = (
+            self._last_run_state == "running"
+            or (self._batch_proc is not None and self._batch_proc.poll() is None)
+        )
+        has_results = self._results_exist() and not running
+        # A loaded config with existing result CSVs is usable even if its
+        # temporary segmentation inputs have subsequently been cleaned up.
+        ready = ready or (has_results and bool(self._loaded_config_path))
+        # Progress tab is available alongside Processing, but starts collapsed.
+        # Loading a config makes it available and expands it even when its
+        # segmentation artifacts have been cleaned up.
+        progress_visible = ready or self._progress_config_loaded
+
+        # The processing buttons stay on screen at all times. They are disabled
+        # until the run can start, so the user always sees the next step
+        # instead of an empty panel.
+        if not self._action_frame.winfo_manager():
+            self._action_frame.pack(fill="x", padx=12, pady=8)
+        if not running:
+            self._run_btn.configure(state="normal" if ready else "disabled")
+        self._update_progress_layout(progress_visible)
+
+        if has_results:
+            if not self._open_results_btn.winfo_manager():
+                self._open_results_btn.pack(side="left", padx=(10, 0))
+        else:
+            self._open_results_btn.pack_forget()
+        for name, glow in self._action_glows.items():
+            glow.set_active(
+                (name == "enter" and visible and not ready)
+                or (name == "processing" and ready and visible and not running and not has_results)
+                or (name == "results" and ready and has_results)
+            )
+
+    # Step 1: Video
+    def _build_video_section(self, parent: ctk.CTkFrame) -> None:
+        frame = ctk.CTkFrame(parent, corner_radius=6)
+        self._video_frame = frame
+        training_row = ctk.CTkFrame(frame, corner_radius=0)
+        training_row.pack(fill="x", padx=8, pady=4)
+        ctk.CTkLabel(
+            training_row, text="Training Video Path", width=135, anchor="w"
+        ).pack(side="left")
+        self._video_entry = ctk.CTkEntry(training_row)
+        self._video_entry.pack(side="left", expand=True, fill="x", padx=5)
+        self._video_entry.bind("<FocusOut>", self._on_training_video_committed)
+        self._video_entry.bind("<Return>", self._on_training_video_committed)
+        self._video_entry.bind(
+            "<KeyRelease>", lambda _event: self._sync_segmentation_status_from_outputs()
+        )
+        ctk.CTkButton(
+            training_row,
+            text="Reference",
+            width=90,
+            command=self._browse_training_video,
+        ).pack(side="left", padx=3)
+        ctk.CTkButton(
+            training_row,
+            text="Add videos",
+            width=100,
+            command=self._add_training_videos,
+        ).pack(side="left", padx=3)
+        ctk.CTkButton(
+            training_row,
+            text="Clear all",
+            width=80,
+            command=self._clear_training_videos,
+        ).pack(side="left", padx=3)
+
+        self._training_videos_list_frame = ctk.CTkFrame(frame, corner_radius=0)
+        self._training_videos_list_frame.pack(fill="x", padx=8, pady=(0, 4))
+        self._training_videos_rows = ctk.CTkScrollableFrame(
+            self._training_videos_list_frame, corner_radius=0, height=84,
+        )
+        self._training_videos_rows.pack(fill="x", padx=2, pady=2)
+        self._training_videos_label = ctk.CTkLabel(
+            frame, text="", anchor="w", text_color="#3B82F6",
+        )
+        self._training_videos_label.pack(fill="x", padx=8, pady=(0, 2))
+        self._training_videos_status = ctk.CTkLabel(
+            frame, text="", anchor="w", text_color="gray",
+        )
+        self._training_videos_status.pack(fill="x", padx=8, pady=(0, 4))
+
+        analysis_row = ctk.CTkFrame(frame, corner_radius=0)
+        analysis_row.pack(fill="x", padx=8, pady=(0, 4))
+        ctk.CTkLabel(
+            analysis_row, text="Analysis Video Path", width=135, anchor="w"
+        ).pack(side="left")
+        self._tracking_video_entry = ctk.CTkEntry(analysis_row)
+        self._tracking_video_entry.pack(side="left", expand=True, fill="x", padx=5)
+        self._tracking_video_button = ctk.CTkButton(
+            analysis_row,
+            text="Reference",
+            width=90,
+            command=self._browse_tracking_video,
+        )
+        self._tracking_video_button.pack(side="left", padx=3)
+        self._tracking_video_dir_checkbox = ctk.CTkCheckBox(
+            analysis_row,
+            text="Select Directory",
+            variable=self._tracking_video_is_dir,
+            command=self._on_tracking_video_mode_changed,
+            width=100,
+        )
+        self._tracking_video_dir_checkbox.pack(side="left", padx=(6, 0))
+
+        session_row = ctk.CTkFrame(frame, corner_radius=0)
+        session_row.pack(fill="x", padx=8, pady=(0, 4))
+        ctk.CTkLabel(session_row, text="Session", width=135, anchor="w").pack(side="left")
+        self._session_entry = ctk.CTkEntry(session_row, placeholder_text="(auto)")
+        self._session_entry.pack(side="left", expand=True, fill="x", padx=5)
+        self._session_entry.bind(
+            "<FocusOut>", lambda _e: self._sync_segmentation_status_from_outputs()
+        )
+        self._session_entry.bind(
+            "<Return>", lambda _e: self._sync_segmentation_status_from_outputs()
+        )
+        ctk.CTkButton(
+            session_row, text="Reference", width=90, command=self._browse_session
+        ).pack(side="left", padx=3)
+
+        action_row = ctk.CTkFrame(frame, corner_radius=0)
+        action_row.pack(fill="x", padx=8, pady=(2, 10))
+        self._seg_btn = ctk.CTkButton(
+            action_row,
+            text="Launch Segmentation",
+            width=230,
+            height=36,
+            border_width=0,
+            border_color="#777777",
+            command=self._launch_segmentation,
+        )
+        self._seg_btn.pack(side="left", padx=(0, 12))
+        self._seg_attention_active = False
+        self._seg_attention_job: str | None = None
+        self._seg_attention_phase = 0.0
+        self._seg_attention_last_time = 0.0
+        self._seg_hovered = False
+        self._seg_border_size: tuple[int, int] | None = None
+        self._seg_border_items = [
+            self._seg_btn._canvas.create_line(
+                0, 0, 0, 0, width=2.6, capstyle=tk.ROUND,
+                tags="segmentation_attention_border", state="hidden",
+            )
+            for _ in range(96)
+        ]
+        self._seg_btn.bind("<Enter>", self._on_segmentation_enter)
+        self._seg_btn.bind("<Leave>", self._on_segmentation_leave)
+        self._seg_btn._canvas.bind(
+            "<Configure>", lambda _event: self.after_idle(self._paint_segmentation_border),
+            add="+",
+        )
+        self._seg_status = ctk.CTkLabel(
+            action_row, text="Not started", text_color="gray", anchor="w"
+        )
+        self._seg_status.pack(side="left")
+        self._refresh_tracking_video_controls()
+
+    @staticmethod
+    def _segmentation_border_points(
+        width: int, height: int, count: int, corner_radius: float, border_width: float,
+    ) -> list[tuple[float, float]]:
+        """Follow the center of CTkButton's native border, including its rounded corners."""
+        inset = border_width / 2
+        left, top, right, bottom = inset, inset, width - inset, height - inset
+        radius = max(1.0, min(corner_radius, width / 2, height / 2) - inset)
+        horizontal = right - left - 2 * radius
+        vertical = bottom - top - 2 * radius
+        arc = math.pi * radius / 2
+        lengths = (horizontal, arc, vertical, arc, horizontal, arc, vertical, arc)
+        perimeter = sum(lengths)
+        result = []
+        for i in range(count):
+            distance = i * perimeter / count
+            for part, length in enumerate(lengths):
+                if distance < length:
+                    t = distance / length
+                    break
+                distance -= length
+            if part == 0:
+                point = (left + radius + t * horizontal, top)
+            elif part == 1:
+                angle = -math.pi / 2 + t * math.pi / 2
+                point = (right - radius + radius * math.cos(angle),
+                         top + radius + radius * math.sin(angle))
+            elif part == 2:
+                point = (right, top + radius + t * vertical)
+            elif part == 3:
+                angle = t * math.pi / 2
+                point = (right - radius + radius * math.cos(angle),
+                         bottom - radius + radius * math.sin(angle))
+            elif part == 4:
+                point = (right - radius - t * horizontal, bottom)
+            elif part == 5:
+                angle = math.pi / 2 + t * math.pi / 2
+                point = (left + radius + radius * math.cos(angle),
+                         bottom - radius + radius * math.sin(angle))
+            elif part == 6:
+                point = (left, bottom - radius - t * vertical)
+            else:
+                angle = math.pi + t * math.pi / 2
+                point = (left + radius + radius * math.cos(angle),
+                         top + radius + radius * math.sin(angle))
+            result.append(point)
+        return result
+
+    def _paint_segmentation_border(self) -> None:
+        if not self._seg_attention_active:
+            return
+        canvas = self._seg_btn._canvas
+        size = (canvas.winfo_width(), canvas.winfo_height())
+        if min(size) < 20:
+            return
+        count = len(self._seg_border_items)
+        if size != self._seg_border_size:
+            points = self._segmentation_border_points(
+                *size, count,
+                self._seg_btn._apply_widget_scaling(self._seg_btn.cget("corner_radius")),
+                self._seg_btn._apply_widget_scaling(self._seg_btn.cget("border_width")),
+            )
+            for i, item in enumerate(self._seg_border_items):
+                x0, y0 = points[i]
+                x1, y1 = points[(i + 1) % count]
+                canvas.coords(item, x0, y0, x1, y1)
+            self._seg_border_size = size
+        for i, item in enumerate(self._seg_border_items):
+            distance = abs((i / count - self._seg_attention_phase + 0.5) % 1 - 0.5)
+            brightness = max(0.0, 1.0 - distance / 0.13) ** 2
+            low, high = (119, 119, 119), (250, 250, 250)
+            color = "#{:02x}{:02x}{:02x}".format(
+                *(round(a + (b - a) * brightness) for a, b in zip(low, high))
+            )
+            canvas.itemconfigure(item, fill=color)
+        canvas.tag_raise("segmentation_attention_border")
+
+    def _animate_segmentation_attention(self) -> None:
+        self._seg_attention_job = None
+        if not self._seg_attention_active or self._seg_hovered:
+            return
+        now = time.monotonic()
+        self._seg_attention_phase = (
+            self._seg_attention_phase + (now - self._seg_attention_last_time) / 3.0
+        ) % 1.0
+        self._seg_attention_last_time = now
+        self._paint_segmentation_border()
+        self._seg_attention_job = self.after(50, self._animate_segmentation_attention)
+
+    def _on_segmentation_enter(self, _event=None) -> None:
+        if self._seg_hovered:
+            return
+        self._seg_hovered = True
+        if self._seg_attention_job is not None:
+            self.after_cancel(self._seg_attention_job)
+            self._seg_attention_job = None
+        self._paint_segmentation_border()
+
+    def _on_segmentation_leave(self, _event=None) -> None:
+        # Moving between the label and the canvas also triggers Leave in CTkButton.
+        self.after(25, self._check_segmentation_hover)
+
+    def _check_segmentation_hover(self) -> None:
+        button = self._seg_btn
+        x, y = self.winfo_pointerx(), self.winfo_pointery()
+        if (button.winfo_rootx() <= x < button.winfo_rootx() + button.winfo_width()
+                and button.winfo_rooty() <= y < button.winfo_rooty() + button.winfo_height()):
+            return
+        if not self._seg_hovered:
+            return
+        self._seg_hovered = False
+        self._seg_attention_last_time = time.monotonic()
+        self._paint_segmentation_border()
+        if self._seg_attention_active:
+            self._animate_segmentation_attention()
+
+    def _set_segmentation_attention(self, active: bool) -> None:
+        if self._seg_attention_active == active:
+            return
+        self._seg_attention_active = active
+        if self._seg_attention_job is not None:
+            self.after_cancel(self._seg_attention_job)
+            self._seg_attention_job = None
+        canvas = self._seg_btn._canvas
+        canvas.itemconfigure(
+            "segmentation_attention_border", state="normal" if active else "hidden"
+        )
+        # The native border is part of the highlight, never a permanent outline.
+        self._seg_btn.configure(border_width=3 if active else 0)
+        self._seg_border_size = None
+        if active:
+            self._seg_attention_phase = 0.0
+            self._seg_attention_last_time = time.monotonic()
+            self._paint_segmentation_border()
+            if not self._seg_hovered:
+                self._animate_segmentation_attention()
+
+
+    @staticmethod
+    def _video_path_key(path: str) -> str:
+        """Compare selected and saved video paths without depending on spelling."""
+        path = str(path or "").strip()
+        return os.path.normcase(os.path.abspath(os.path.expanduser(path))) if path else ""
+
+    @staticmethod
+    def _standard_session_for_video(path: str) -> str:
+        """Default session path: <video_dir>/fbq_<video_stem>."""
+        path = str(path or "").strip()
+        if not path:
+            return ""
+        return os.path.join(
+            os.path.dirname(path),
+            "fbq_" + os.path.splitext(os.path.basename(path))[0],
+        )
+
+    def _auto_load_video_config(self, video_path: str) -> bool:
+        """Restore saved settings when a video has an existing session config."""
+        if not video_path or not os.path.isfile(video_path):
+            return False
+        session = self._get_session()
+        standard_session = self._standard_session_for_video(video_path)
+        candidates = [os.path.join(session, "config.yaml")] if session else []
+        standard_config = os.path.join(standard_session, "config.yaml")
+        if not any(self._video_path_key(path) == self._video_path_key(standard_config)
+                   for path in candidates):
+            candidates.append(standard_config)
+
+        for candidate in candidates:
+            if not os.path.isfile(candidate):
+                continue
+            if self._load_config_path(candidate, expected_video=video_path, quiet=True):
+                print(f"[Easy Tracking] Auto-loaded saved config: {candidate}", flush=True)
+                return True
+        return False
+
+    def _set_training_video(
+        self, path: str, *, sync_analysis: bool = True, auto_load_config: bool = True,
+    ) -> None:
+        path = os.path.normpath(str(path).strip()) if path else ""
+        previous_video = self._selected_training_video
+        changed_video = self._video_path_key(path) != self._video_path_key(previous_video)
+        if changed_video:
+            session = self._session_entry.get().strip()
+            # Switching to a different video must not retain the previous
+            # video's session (including a previously selected custom path).
+            # A session explicitly chosen before the FIRST video is respected.
+            if previous_video or not session:
+                new_session = self._standard_session_for_video(path)
+                self._session_entry.delete(0, tk.END)
+                if new_session:
+                    self._session_entry.insert(0, new_session)
+
+            # Do not keep using another video's saved config path or animal count.
+            self._loaded_cfg = {}
+            self._loaded_config_path = ""
+            self._loaded_easy_answers = {}
+            self._progress_config_loaded = False
+            self._progress_details_open = True
+            self._num_confirmed = False
+            self._confirmed_num_objects = 1
+            self._variable_count.set(False)
+            self._num_objects_sb.configure(state="normal")
+            self._num_enter_button.configure(state="normal")
+            self._num_objects_sb.delete(0, tk.END)
+            self._num_objects_sb.insert(0, "1")
+            self._apply_individual_count_state()
+
+        self._selected_training_video = path
+        self._video_entry.delete(0, tk.END)
+        if path:
+            self._video_entry.insert(0, path)
+        if path != self._last_training_video_for_extras:
+            # The extra videos are trained on beside the reference video, so
+            # they stay when the reference video changes. Only the video that
+            # became the reference one is taken out of the list.
+            self._extra_training_videos = [
+                item for item in self._extra_training_videos if item != path
+            ]
+            self._refresh_training_videos_label()
+        self._last_training_video_for_extras = path
+
+        if sync_analysis:
+            self._tracking_video_is_dir.set(False)
+            self._tracking_video_entry.configure(state="normal")
+            self._tracking_video_entry.delete(0, tk.END)
+            if path:
+                self._tracking_video_entry.insert(0, path)
+
+        self._refresh_tracking_video_controls()
+        self._update_session_label()
+        # Re-selecting a video must behave like Load Config, not silently
+        # fall back to the default animal count.
+        if auto_load_config and (changed_video or not self._loaded_config_path):
+            self._auto_load_video_config(path)
+
+    def _browse_training_video(self) -> None:
+        prepared = ask_open_analysis_video(
+            self,
+            title="Select training video",
+            log=lambda message: print(f"[video] {message}", flush=True),
+        )
+        if prepared is None:
+            return
+        self._set_training_video(prepared.path, sync_analysis=True)
+
+    def _browse_video(self) -> None:
+        """Backward-compatible alias for the former single-video UI."""
+        self._browse_training_video()
+
+    def _add_training_videos(self) -> None:
+        """Add more videos to learn the detector from."""
+        paths = ask_open_analysis_videos(
+            self,
+            title="Select the videos to train on",
+        )
+        if not paths:
+            return
+        main_video = self._video_entry.get().strip()
+        videos = list(self._extra_training_videos)
+        for path in paths:
+            if path != main_video and path not in videos:
+                videos.append(path)
+        self._extra_training_videos = videos
+        self._refresh_training_videos_label()
+        self._set_training_videos_status(
+            f"Training on {len(videos) + 1} videos: every video needs its own segmentation."
+        )
+
+    def _refresh_training_videos_label(self) -> None:
+        """Show the videos the detector is learned from."""
+        label = getattr(self, "_training_videos_label", None)
+        videos = list(self._extra_training_videos)
+        self._rebuild_training_video_rows(videos)
+        if label is None:
+            return
+        if not videos:
+            label.configure(text="")
+            return
+        names = ", ".join(os.path.basename(path) for path in videos)
+        label.configure(text=f"Also trained on: {names}")
+
+    def _rebuild_training_video_rows(self, videos: list[str]) -> None:
+        """Show one row per extra training video, each with its own delete."""
+        rows = getattr(self, "_training_videos_rows", None)
+        if rows is None:
+            return
+        for child in rows.winfo_children():
+            try:
+                child.destroy()
+            except tk.TclError:
+                pass
+        for path in videos:
+            row = ctk.CTkFrame(rows, corner_radius=0)
+            row.pack(fill="x", pady=1)
+            row.grid_columnconfigure(1, weight=1)
+            ctk.CTkLabel(
+                row, text=os.path.basename(path), anchor="w", width=240,
+            ).grid(row=0, column=0, sticky="w", padx=4)
+            ctk.CTkLabel(
+                row, text=path, anchor="w", text_color="gray",
+            ).grid(row=0, column=1, sticky="w", padx=4)
+            ctk.CTkButton(
+                row, text="x", width=28, command=lambda p=path: self._remove_training_video(p),
+            ).grid(row=0, column=2, sticky="e", padx=3)
+
+    def _set_training_videos_status(self, text: str) -> None:
+        """Say what happened to the list of training videos."""
+        label = getattr(self, "_training_videos_status", None)
+        if label is not None:
+            label.configure(text=str(text))
+
+    def _remove_training_video(self, path: str) -> None:
+        """Take one video out of the list of training videos."""
+        videos = [item for item in self._extra_training_videos if item != path]
+        if len(videos) == len(self._extra_training_videos):
+            return
+        self._extra_training_videos = videos
+        self._refresh_training_videos_label()
+        self._set_training_videos_status(f"The detector is learned from {len(videos) + 1} videos")
+
+    def _clear_training_videos(self) -> None:
+        """Delete every video that was added besides the reference one."""
+        if not self._extra_training_videos:
+            self._set_training_videos_status("There is no other video to delete")
+            return
+        self._extra_training_videos = []
+        self._refresh_training_videos_label()
+        self._set_training_videos_status("The extra training videos were deleted")
+
+    def _on_training_video_committed(self, _event=None):
+        training = self._video_entry.get().strip()
+        if training:
+            self._set_training_video(training, sync_analysis=True)
+        else:
+            self._tracking_video_entry.configure(state="normal")
+            self._tracking_video_entry.delete(0, tk.END)
+            self._tracking_video_is_dir.set(False)
+            self._refresh_tracking_video_controls()
+            self._sync_segmentation_status_from_outputs()
+        return "break"
+
+    def _reset_prepared_tracking_directory(self) -> None:
+        self._prepared_tracking_directory = ""
+        self._prepared_tracking_files = []
+        self._prepared_tracking_source_signature = ()
+
+    def _tracking_directory_candidates(self, directory: str) -> list[str]:
+        return [
+            os.path.join(directory, name)
+            for name in sorted(os.listdir(directory))
+            if os.path.isfile(os.path.join(directory, name))
+            and os.path.splitext(name)[1].lower() in VIDEO_DROP_SUFFIXES
+        ]
+
+    @staticmethod
+    def _tracking_source_signature(paths: list[str]) -> tuple[tuple[str, int, int], ...]:
+        signature: list[tuple[str, int, int]] = []
+        for path in paths:
+            stat = os.stat(path)
+            signature.append(
+                (
+                    os.path.normcase(os.path.abspath(path)),
+                    stat.st_mtime_ns,
+                    stat.st_size,
+                )
+            )
+        return tuple(signature)
+
+    def _prepare_tracking_directory(self, directory: str) -> list[str] | None:
+        candidates = self._tracking_directory_candidates(directory)
+        if not candidates:
+            messagebox.showerror(
+                "Error",
+                "The selected analysis directory contains no supported video files "
+                "at its top level.",
+                parent=self,
+            )
+            return None
+
+        try:
+            signature = self._tracking_source_signature(candidates)
+        except OSError as exc:
+            messagebox.showerror(
+                "Error",
+                f"Failed to inspect the analysis directory:\n{exc}",
+                parent=self,
+            )
+            return None
+
+        normalized_directory = os.path.normcase(os.path.abspath(directory))
+        if (
+            normalized_directory == self._prepared_tracking_directory
+            and signature == self._prepared_tracking_source_signature
+            and self._prepared_tracking_files
+            and all(os.path.isfile(path) for path in self._prepared_tracking_files)
+        ):
+            return list(self._prepared_tracking_files)
+
+        prepared_files: list[str] = []
+        for path in candidates:
+            prepared = prepare_analysis_video(
+                self,
+                path,
+                log=lambda message, name=os.path.basename(path): print(
+                    f"[video:{name}] {message}",
+                    flush=True,
+                ),
+            )
+            if prepared is None:
+                self._reset_prepared_tracking_directory()
+                return None
+            prepared_files.append(prepared.path)
+
+        self._prepared_tracking_directory = normalized_directory
+        self._prepared_tracking_source_signature = signature
+        self._prepared_tracking_files = list(prepared_files)
+        return prepared_files
+
+    def _browse_tracking_video(self) -> None:
+        if not self._video_entry.get().strip():
+            return
+        current = self._tracking_video_entry.get().strip()
+        if self._tracking_video_is_dir.get():
+            initial = current if os.path.isdir(current) else os.path.dirname(current)
+            if not initial:
+                initial = os.path.dirname(self._video_entry.get().strip()) or os.getcwd()
+            path = filedialog.askdirectory(initialdir=initial)
+            if not path:
+                return
+            prepared_files = self._prepare_tracking_directory(path)
+            if prepared_files is None:
+                return
+            self._tracking_video_entry.delete(0, tk.END)
+            self._tracking_video_entry.insert(0, path)
+            return
+
+        prepared = ask_open_analysis_video(
+            self,
+            title="Select analysis video",
+            log=lambda message: print(f"[video] {message}", flush=True),
+        )
+        if prepared is None:
+            return
+        self._tracking_video_entry.delete(0, tk.END)
+        self._tracking_video_entry.insert(0, prepared.path)
+
+    def _on_tracking_video_mode_changed(self) -> None:
+        self._reset_prepared_tracking_directory()
+        if not self._video_entry.get().strip():
+            self._tracking_video_is_dir.set(False)
+            self._refresh_tracking_video_controls()
+            return
+        current = self._tracking_video_entry.get().strip()
+        self._tracking_video_entry.configure(state="normal")
+        if self._tracking_video_is_dir.get():
+            if current and not os.path.isdir(current):
+                self._tracking_video_entry.delete(0, tk.END)
+        else:
+            if not current or os.path.isdir(current):
+                training = self._video_entry.get().strip()
+                self._tracking_video_entry.delete(0, tk.END)
+                if training:
+                    self._tracking_video_entry.insert(0, training)
+        self._refresh_tracking_video_controls()
+
+    def _refresh_tracking_video_controls(self) -> None:
+        if not hasattr(self, "_tracking_video_entry"):
+            return
+        enabled = bool(self._video_entry.get().strip())
+        state = "normal" if enabled else "disabled"
+        self._tracking_video_entry.configure(state=state)
+        self._tracking_video_button.configure(state=state)
+        self._tracking_video_dir_checkbox.configure(state=state)
+
+    def _handle_dropped_training_video(self, path: str) -> None:
+        prepared = prepare_analysis_video(
+            self,
+            path,
+            log=lambda message: print(f"[video] {message}", flush=True),
+        )
+        if prepared is None:
+            return
+        self._set_training_video(prepared.path, sync_analysis=True)
+
+    def _update_session_label(self) -> None:
+        if not self._session_entry.get().strip():
+            session = self._standard_session_for_video(self._video_entry.get().strip())
+            if session:
+                self._session_entry.delete(0, tk.END)
+                self._session_entry.insert(0, session)
+        self._refresh_tracking_video_controls()
+        self._sync_segmentation_status_from_outputs()
+
+    def _browse_session(self) -> None:
+        current = self._session_entry.get().strip()
+        initial = current if os.path.isdir(current) else os.path.dirname(current) if current else os.getcwd()
+        path = filedialog.askdirectory(initialdir=initial)
+        if path:
+            self._session_entry.delete(0, tk.END)
+            self._session_entry.insert(0, path)
+            self._sync_segmentation_status_from_outputs()
+
+    def _get_session(self) -> str:
+        s = self._session_entry.get().strip()
+        if s:
+            return s
+        v = self._video_entry.get().strip()
+        if not v:
+            return ""
+        stem = os.path.splitext(os.path.basename(v))[0]
+        return os.path.join(os.path.dirname(v), f"fbq_{stem}")
+
+    def _apply_startup_paths(self, video_path: str = "", session_path: str = "") -> None:
+        if video_path:
+            # Apply an explicit --session before searching for saved settings.
+            self._set_training_video(
+                video_path, sync_analysis=True, auto_load_config=False,
+            )
+        if session_path:
+            self._session_entry.delete(0, tk.END)
+            self._session_entry.insert(0, session_path)
+        elif video_path:
+            self._update_session_label()
+        if video_path:
+            self._auto_load_video_config(video_path)
+        self._refresh_tracking_video_controls()
+        self._sync_segmentation_status_from_outputs()
+
+    @staticmethod
+    def _file_signature(path: str) -> tuple[int, int] | None:
+        try:
+            stat = os.stat(path)
+        except OSError:
+            return None
+        return stat.st_mtime_ns, stat.st_size
+
+    def _segmentation_output_paths(self, cfg: dict | None = None) -> tuple[str, str]:
+        cfg = cfg or {}
+        video = str(cfg.get("TRAINING_VIDEO_PATH", "") or "").strip()
+        if not video:
+            video = self._video_entry.get().strip()
+        session = str(cfg.get("SESSION_PATH", "") or "").strip()
+        if not session:
+            session = self._get_session()
+        return segmentation_paths_for_session(session, video)
+
+    def _segmentation_finished_for_current_launch(self) -> bool:
+        if self._seg_proc is None or self._seg_proc.poll() is not None:
+            return self._segmentation_outputs_exist()
+        pickle_path, _background_path = self._segmentation_output_paths()
+        current_signature = self._file_signature(pickle_path)
+        return bool(
+            current_signature is not None
+            and current_signature != self._seg_launch_pickle_signature
+            and self._segmentation_outputs_exist()
+        )
+
+    def _poll_segmentation_status(self) -> None:
+        self._seg_poll_id = None
+        if self._seg_proc is None:
+            return
+        self._sync_segmentation_status_from_outputs()
+        if self._seg_proc.poll() is None:
+            self._seg_poll_id = self.after(300, self._poll_segmentation_status)
+
+    def _launch_segmentation(self) -> None:
+        video = self._video_entry.get().strip()
+        if not video:
+            messagebox.showwarning("No video", "Please select a video file first.")
+            return
+        # Show that the request was accepted before anything else can fail,
+        # so the click always has a visible answer.
+        self._set_segmentation_button_state(processing=True)
+        self._seg_status.configure(text="Processing...", text_color="#F2B544")
+        self.update_idletasks()
+        pickle_path, _background_path = self._segmentation_output_paths()
+        self._seg_launch_pickle_signature = self._file_signature(pickle_path)
+        seg_script = str(gui_script("gui_segmentation.py"))
+        fd, handoff_path = tempfile.mkstemp(
+            prefix="fbq_segmentation_", suffix=".json",
+        )
+        os.close(fd)
+        self._seg_handoff_path = handoff_path
+        cmd = [
+            sys.executable, "-u", seg_script, "--return-to-easy",
+            "--easy-handoff-file", handoff_path,
+        ]
+        if video:
+            cmd += ["--video", video]
+        session = self._get_session()
+        if session:
+            cmd += ["--session", session]
+        # The other videos of the run are segmented with the same settings.
+        extra_videos = [
+            path for path in self._extra_training_videos
+            if path and path != video and os.path.isfile(path)
+        ]
+        if extra_videos:
+            cmd += ["--extra-videos", json.dumps(extra_videos)]
+        try:
+            self._seg_proc = subprocess.Popen(cmd)
+        except OSError as exc:
+            self._seg_handoff_path = ""
+            try:
+                os.unlink(handoff_path)
+            except OSError:
+                pass
+            self._set_segmentation_button_state(processing=False)
+            self._seg_status.configure(text="Not started", text_color="gray")
+            messagebox.showerror("Launch Segmentation", str(exc), parent=self)
+            return
+        self._seg_status.configure(text="Running...", text_color="#F2B544")
+        self._sync_segmentation_status_from_outputs()
+        if self._seg_poll_id is not None:
+            try:
+                self.after_cancel(self._seg_poll_id)
+            except Exception:
+                pass
+        self._seg_poll_id = self.after(300, self._poll_segmentation_status)
+        threading.Thread(target=self._watch_seg, daemon=True).start()
+
+    def _watch_seg(self) -> None:
+        proc = self._seg_proc
+        if proc is None:
+            return
+        proc.wait()
+        self._post_ui_event(self._on_seg_done, proc)
+
+    def _consume_segmentation_handoff(self) -> bool:
+        """Recover the exact output session after the child completes Processing."""
+        path = self._seg_handoff_path
+        self._seg_handoff_path = ""
+        if not path:
+            return False
+        try:
+            with open(path, "r", encoding="utf-8") as file:
+                handoff = json.load(file)
+        except (OSError, ValueError):
+            return False
+        finally:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+
+        if not isinstance(handoff, dict):
+            return False
+        video = self._video_entry.get().strip()
+        session = str(handoff.get("session_path", "") or "").strip()
+        if not video or not session:
+            return False
+        if self._video_path_key(handoff.get("video_path", "")) != self._video_path_key(video):
+            return False
+        expected_pickle, expected_bg = segmentation_paths_for_session(session, video)
+        if not all((
+            self._video_path_key(handoff.get("pickle_path", "")) == self._video_path_key(expected_pickle),
+            self._video_path_key(handoff.get("background_path", "")) == self._video_path_key(expected_bg),
+            os.path.isfile(expected_pickle),
+            os.path.isfile(expected_bg),
+        )):
+            return False
+
+        if self._video_path_key(session) != self._video_path_key(self._get_session()):
+            self._session_entry.delete(0, tk.END)
+            self._session_entry.insert(0, session)
+            # Never save a new Tracking config over a different session.
+            if isinstance(self._loaded_cfg, dict) and self._loaded_cfg:
+                self._loaded_cfg["SESSION_PATH"] = session
+            self._loaded_config_path = (
+                os.path.join(session, "config.yaml")
+                if os.path.isfile(os.path.join(session, "config.yaml"))
+                else ""
+            )
+        print(f"[Easy Tracking] Segmentation completed: {expected_pickle}", flush=True)
+        return True
+
+    def _set_segmentation_button_state(self, processing: bool) -> None:
+        """Show on the button itself that the segmentation is being processed."""
+        if processing:
+            self._seg_btn.configure(
+                text="Processing…",
+                state="disabled",
+                fg_color="#1D4ED8",
+                hover_color="#1D4ED8",
+            )
+            return
+        self._seg_btn.configure(
+            text="Launch Segmentation",
+            state="normal",
+            fg_color=ctk.ThemeManager.theme["CTkButton"]["fg_color"],
+            hover_color=ctk.ThemeManager.theme["CTkButton"]["hover_color"],
+        )
+
+    def _on_seg_done(self, proc: subprocess.Popen) -> None:
+        if self._seg_proc is not proc:
+            return
+        self._seg_proc = None
+        if self._seg_poll_id is not None:
+            try:
+                self.after_cancel(self._seg_poll_id)
+            except Exception:
+                pass
+            self._seg_poll_id = None
+        got_handoff = self._consume_segmentation_handoff()
+        self._sync_segmentation_status_from_outputs()
+        if not got_handoff and not self._segmentation_outputs_exist():
+            self._seg_status.configure(
+                text="No completed output (run Processing in Segmentation)",
+                text_color="#e69b42",
+            )
+        self._set_segmentation_button_state(processing=False)
+        self.lift()
+        self.focus_force()
+
+    def _segmentation_outputs_exist(self, cfg: dict | None = None) -> bool:
+        pickle_path, background_path = self._segmentation_output_paths(cfg)
+        return bool(
+            pickle_path
+            and background_path
+            and os.path.isfile(pickle_path)
+            and os.path.isfile(background_path)
+        )
+
+    def _sync_segmentation_status_from_outputs(self, cfg: dict | None = None) -> None:
+        if not hasattr(self, "_seg_status"):
+            return
+        self._reveal_video_details_if_selected()
+        running = self._seg_proc is not None and self._seg_proc.poll() is None
+        completed = (
+            self._segmentation_finished_for_current_launch()
+            if running else self._segmentation_outputs_exist(cfg)
+        )
+        if running and not completed:
+            self._seg_status.configure(text="Running...", text_color="#F2B544")
+        elif completed:
+            self._seg_status.configure(text="Done", text_color="#3B82F6")
+        else:
+            self._seg_status.configure(text="Not started", text_color="gray")
+        # Collapse Step 1 only after the Segmentation GUI has returned.
+        self._set_post_segmentation_visibility(completed and not running)
+        self._set_segmentation_attention(
+            os.path.isfile(self._video_entry.get().strip()) and not completed and not running
+        )
+        self._update_next_action()
+
+    # Step 2: Questions
+    # --- Analysis-time ROIs ---------------------------------------------------
+
+    def _build_analysis_roi_section(self, parent) -> None:
+        """Add the ROI editor of the final analysis.
+
+        The ROIs are added after the segmentation model is trained: they say
+        which part of the frame holds the fish, and how many animals each
+        part holds. The number of animals can be exact, an estimate, or
+        unknown because the part is crowded.
+        """
+        self._analysis_roi_rows: list[dict] = []
+        self._analysis_roi_use = tk.BooleanVar(value=False)
+        self._analysis_roi_per_arena = tk.BooleanVar(value=True)
+        self._analysis_roi_summary: ctk.CTkLabel | None = None
+
+        header = ctk.CTkFrame(parent, corner_radius=0)
+        header.pack(fill="x", pady=4)
+        ctk.CTkLabel(
+            header,
+            text="Which part of the frame holds the fish?",
+            width=300, anchor="w",
+        ).pack(side="left")
+        ctk.CTkCheckBox(
+            header, text="Use ROIs", variable=self._analysis_roi_use,
+            command=self._on_analysis_roi_use_changed,
+        ).pack(side="left", padx=4)
+        ctk.CTkCheckBox(
+            header, text="One arena per ROI", variable=self._analysis_roi_per_arena,
+            command=self._on_analysis_roi_use_changed,
+        ).pack(side="left", padx=4)
+
+        body = ctk.CTkFrame(parent, corner_radius=0)
+        body.pack(fill="x", pady=(0, 4))
+        columns = ctk.CTkFrame(body, corner_radius=0)
+        columns.pack(fill="x")
+        for text, width in (
+            ("ROI", 100), ("Rectangle x0 y0 x1 y1", 190), ("Animals", 70), ("Population", 110),
+        ):
+            ctk.CTkLabel(columns, text=text, width=width, anchor="w").pack(side="left", padx=3)
+
+        self._analysis_roi_rows_frame = ctk.CTkFrame(body, corner_radius=0)
+        self._analysis_roi_rows_frame.pack(fill="x", pady=2)
+
+        actions = ctk.CTkFrame(parent, corner_radius=0)
+        actions.pack(fill="x", pady=(0, 4))
+        ctk.CTkButton(
+            actions, text="Add ROI", width=90, command=self._add_analysis_roi_row,
+        ).pack(side="left")
+        ctk.CTkButton(
+            actions, text="Clear", width=70, command=self._clear_analysis_roi_rows,
+        ).pack(side="left", padx=4)
+        ctk.CTkButton(
+            actions, text="From segmentation", width=140,
+            command=self._load_analysis_rois_from_segmentation,
+        ).pack(side="left")
+        self._analysis_roi_summary = ctk.CTkLabel(actions, text="", text_color="gray", anchor="w")
+        self._analysis_roi_summary.pack(side="left", padx=8)
+
+        self._build_roi_picker(parent)
+
+    def _on_analysis_roi_use_changed(self) -> None:
+        self._update_analysis_roi_summary()
+
+    def _add_analysis_roi_row(self, roi: dict | None = None) -> None:
+        """Add one ROI of the analysis."""
+        roi = dict(roi or {})
+        row = ctk.CTkFrame(self._analysis_roi_rows_frame, corner_radius=0)
+        row.pack(fill="x", pady=2)
+        index = len(self._analysis_roi_rows)
+
+        enabled = tk.BooleanVar(value=bool(roi.get("enabled", True)))
+        name = tk.StringVar(value=str(roi.get("name", f"Arena{index + 1}")))
+        count = tk.StringVar(value=str(int(roi.get("n_animals", 0) or 0)))
+        mode = tk.StringVar(value=str(roi.get("population", "") or _POPULATION_CROWDED))
+        points = roi.get("points_normalized") or roi.get("points") or []
+        rectangle = _roi_rectangle_text(points)
+
+        ctk.CTkCheckBox(row, text="", width=20, variable=enabled).pack(side="left", padx=3)
+        ctk.CTkEntry(row, textvariable=name, width=100).pack(side="left", padx=3)
+        rect_entry = ctk.CTkEntry(row, width=190)
+        rect_entry.insert(0, rectangle)
+        rect_entry.pack(side="left", padx=3)
+        count_entry = ctk.CTkEntry(row, textvariable=count, width=70)
+        count_entry.pack(side="left", padx=3)
+        mode_box = ctk.CTkComboBox(
+            row, values=[_POPULATION_FIXED, _POPULATION_ESTIMATED, _POPULATION_CROWDED],
+            state="readonly", width=110,
+        )
+        mode_box.set(mode.get() if mode.get() in {
+            _POPULATION_FIXED, _POPULATION_ESTIMATED, _POPULATION_CROWDED,
+        } else _POPULATION_CROWDED)
+        mode_box.pack(side="left", padx=3)
+        remove_button = ctk.CTkButton(
+            row, text="x", width=30, command=lambda: self._remove_analysis_roi_row(index),
+        )
+        remove_button.pack(side="left", padx=3)
+
+        self._analysis_roi_rows.append({
+            "enabled": enabled,
+            "name": name,
+            "rect": rect_entry,
+            "count": count,
+            "mode": mode_box,
+            "points": points,
+            "shape": str(roi.get("shape", "") or "rectangle"),
+            "original_rect": rectangle,
+            "frame": row,
+            "remove": remove_button,
+        })
+        self._refresh_analysis_roi_indices()
+        self._update_analysis_roi_summary()
+
+    def _remove_analysis_roi_row(self, index: int) -> None:
+        if not 0 <= index < len(self._analysis_roi_rows):
+            return
+        row = self._analysis_roi_rows.pop(index)
+        try:
+            row["frame"].destroy()
+        except tk.TclError:
+            pass
+        self._refresh_analysis_roi_indices()
+        self._update_analysis_roi_summary()
+
+    def _clear_analysis_roi_rows(self) -> None:
+        for row in list(self._analysis_roi_rows):
+            try:
+                row["frame"].destroy()
+            except tk.TclError:
+                pass
+        self._analysis_roi_rows = []
+        self._update_analysis_roi_summary()
+
+    # ------------------------------------------------------------------
+    # Drawing the arenas on the video frame
+    # ------------------------------------------------------------------
+
+    def _build_roi_picker(self, parent) -> None:
+        """Add the panel where the arenas are drawn on a frame of the video."""
+        picker = ctk.CTkFrame(parent, corner_radius=0)
+        picker.pack(fill="x", pady=(0, 4))
+        header = ctk.CTkFrame(picker, corner_radius=0)
+        header.pack(fill="x")
+        ctk.CTkLabel(
+            header, text="Draw the arena on the frame", width=200, anchor="w",
+        ).pack(side="left")
+        ctk.CTkLabel(header, text="Frame", width=50, anchor="w").pack(side="left", padx=(6, 0))
+        self._analysis_roi_frame_entry = ctk.CTkEntry(header, width=60)
+        self._analysis_roi_frame_entry.insert(0, "0")
+        self._analysis_roi_frame_entry.pack(side="left", padx=3)
+        ctk.CTkButton(
+            header, text="Show", width=70, command=self._show_roi_picker_frame,
+        ).pack(side="left", padx=3)
+        ctk.CTkButton(
+            header, text="Add arena", width=90, command=self._add_arena_from_picker,
+        ).pack(side="right", padx=3)
+
+        self._analysis_roi_canvas = tk.Canvas(picker, height=260, bg="#0d1216", highlightthickness=0)
+        self._analysis_roi_canvas.pack(fill="both", expand=True, padx=4, pady=(2, 4))
+        self._analysis_roi_canvas.bind("<Button-1>", self._on_roi_picker_press)
+        self._analysis_roi_canvas.bind("<B1-Motion>", self._on_roi_picker_drag)
+        self._analysis_roi_canvas.bind("<ButtonRelease-1>", self._on_roi_picker_release)
+        self._analysis_roi_picker_photo = None
+        self._analysis_roi_picker_box: tuple[int, int, int, int] = (0, 0, 0, 0)
+        self._analysis_roi_picker_drag: tuple[int, int] | None = None
+        self._analysis_roi_picker_rect: tuple[int, int, int, int] | None = None
+        self._analysis_roi_picker_status = ctk.CTkLabel(
+            picker, text="No frame is shown yet.", anchor="w", text_color="gray",
+        )
+        self._analysis_roi_picker_status.pack(fill="x", padx=4, pady=(0, 2))
+
+    def _roi_picker_video(self) -> str:
+        """The video the arenas are drawn on."""
+        analysis = str(self._tracking_video_entry.get().strip() or "")
+        if analysis and os.path.isfile(analysis):
+            return analysis
+        training = str(self._video_entry.get().strip() or "")
+        if training and os.path.isfile(training):
+            return training
+        return ""
+
+    def _show_roi_picker_frame(self, frame_index: int | None = None) -> None:
+        """Show one frame of the video, so an arena can be drawn on it."""
+        if not _HAS_CV2:
+            messagebox.showerror("Error", "OpenCV is not available.")
+            return
+        video = self._roi_picker_video()
+        if not video:
+            messagebox.showinfo("Arena", "Choose a video first.")
+            return
+        try:
+            index = int(self._analysis_roi_frame_entry.get().strip() or 0)
+        except (TypeError, ValueError):
+            index = 0
+        if frame_index is not None:
+            index = int(frame_index)
+        index = max(0, index)
+        cap = cv2.VideoCapture(video)
+        try:
+            if index > 0:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, index)
+            ok, frame = cap.read()
+        finally:
+            cap.release()
+        if not ok or frame is None or frame.size == 0:
+            messagebox.showerror("Error", f"The frame {index} could not be read.")
+            return
+        self._analysis_roi_frame_entry.delete(0, tk.END)
+        self._analysis_roi_frame_entry.insert(0, str(index))
+        self._draw_roi_picker_frame(frame)
+
+    def _draw_roi_picker_frame(self, frame) -> None:
+        """Put a video frame on the canvas of the arena picker."""
+        from PIL import Image, ImageTk
+
+        canvas = getattr(self, "_analysis_roi_canvas", None)
+        if canvas is None:
+            return
+        canvas.delete("all")
+        canvas_width = max(1, canvas.winfo_width())
+        if canvas_width < 32:
+            # The window may not be on screen yet, so the canvas has no size.
+            canvas_width = 320
+        height, width = frame.shape[:2]
+        if width <= 0 or height <= 0:
+            return
+        scale = canvas_width / float(width)
+        image_height = max(1, int(round(height * scale)))
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        image = Image.fromarray(rgb).resize((canvas_width, image_height))
+        photo = ImageTk.PhotoImage(image)
+        self._analysis_roi_picker_photo = photo
+        canvas.create_image(0, 0, image=photo, anchor="nw")
+        self._analysis_roi_picker_box = (0, 0, canvas_width, image_height)
+        self._analysis_roi_picker_rect = None
+        self._analysis_roi_picker_status.configure(
+            text="Drag on the frame to mark an arena, then press Add arena."
+        )
+
+    def _on_roi_picker_press(self, event) -> None:
+        self._analysis_roi_picker_drag = (int(event.x), int(event.y))
+
+    def _on_roi_picker_drag(self, event) -> None:
+        if self._analysis_roi_picker_drag is None:
+            return
+        x0, y0 = self._analysis_roi_picker_drag
+        x1, y1 = int(event.x), int(event.y)
+        canvas = getattr(self, "_analysis_roi_canvas", None)
+        if canvas is None:
+            return
+        canvas.delete("roi_picker_rect")
+        canvas.create_rectangle(
+            x0, y0, x1, y1, outline="#38bdf8", width=2, tags="roi_picker_rect",
+        )
+        self._analysis_roi_picker_rect = (x0, y0, x1, y1)
+
+    def _on_roi_picker_release(self, event) -> None:
+        if self._analysis_roi_picker_drag is None:
+            return
+        x0, y0 = self._analysis_roi_picker_drag
+        x1, y1 = int(event.x), int(event.y)
+        self._analysis_roi_picker_drag = None
+        if abs(x1 - x0) < 4 or abs(y1 - y0) < 4:
+            self._analysis_roi_picker_rect = None
+            return
+        self._analysis_roi_picker_rect = (x0, y0, x1, y1)
+
+    def _add_arena_from_picker(self) -> None:
+        """Turn the marked area of the frame into an arena."""
+        if not self._analysis_roi_picker_rect:
+            messagebox.showinfo("Arena", "Mark an area on the frame first.")
+            return
+        left, top, width, height = self._analysis_roi_picker_box
+        if width <= 0 or height <= 0:
+            messagebox.showinfo("Arena", "Show a frame first.")
+            return
+        x0, y0, x1, y1 = self._analysis_roi_picker_rect
+        x0, x1 = sorted((x0, x1))
+        y0, y1 = sorted((y0, y1))
+        x0 = max(left, min(left + width - 1, x0))
+        x1 = max(left, min(left + width - 1, x1))
+        y0 = max(top, min(top + height - 1, y0))
+        y1 = max(top, min(top + height - 1, y1))
+        points = [
+            [(x0 - left) / width, (y0 - top) / height],
+            [(x1 - left) / width, (y0 - top) / height],
+            [(x1 - left) / width, (y1 - top) / height],
+            [(x0 - left) / width, (y1 - top) / height],
+        ]
+        points = [[round(float(x), 6), round(float(y), 6)] for x, y in points]
+        name = f"Arena{len(self._analysis_roi_rows) + 1}"
+        self._add_analysis_roi_row({
+            "enabled": True,
+            "name": name,
+            "n_animals": 0,
+            "population": _POPULATION_CROWDED,
+            "points_normalized": points,
+            "shape": "rectangle",
+        })
+        # An arena that is drawn on the frame is meant to be used.
+        if not self._analysis_roi_use.get():
+            self._analysis_roi_use.set(True)
+            self._on_analysis_roi_use_changed()
+        self._analysis_roi_picker_rect = None
+        self._analysis_roi_picker_status.configure(text=f"{name} was drawn on the frame")
+
+    def _refresh_analysis_roi_indices(self) -> None:
+        for index, row in enumerate(self._analysis_roi_rows):
+            button = row.get("remove")
+            if button is not None:
+                button.configure(command=lambda i=index: self._remove_analysis_roi_row(i))
+
+    def _update_analysis_roi_summary(self) -> None:
+        """Show what the ROIs declare, so the user sees it at a glance."""
+        if self._analysis_roi_summary is None:
+            return
+        rois = self._collect_analysis_rois(quiet=True)
+        if not rois:
+            self._analysis_roi_summary.configure(
+                text="No ROI is used" if not self._analysis_roi_use.get() else "No ROI defined",
+                text_color="gray",
+            )
+            return
+        model = roi_population_model(rois)
+        parts = [
+            f"{roi['name']}: {roi['n_animals']} ({roi['population']})"
+            for roi in rois
+        ]
+        text = " · ".join(parts) + f" · total {model['total_expected']}"
+        if model["variable"]:
+            text += " · variable population"
+        self._analysis_roi_summary.configure(text=text, text_color="#3B82F6")
+
+    def _collect_analysis_rois(self, quiet: bool = False) -> list[dict]:
+        """Return the ROIs the editor describes, ready for the configuration."""
+        if not getattr(self, "_analysis_roi_use", None) or not self._analysis_roi_use.get():
+            return []
+        rois: list[dict] = []
+        for index, row in enumerate(self._analysis_roi_rows):
+            name = str(row["name"].get()).strip() or f"ROI {index + 1}"
+            if not row["enabled"].get():
+                continue
+            text = str(row["rect"].get()).replace(",", " ").split()
+            if len(text) != 4:
+                if quiet:
+                    continue
+                raise ValueError(
+                    f"{name}: the rectangle needs four numbers: x0 y0 x1 y1."
+                )
+            try:
+                x0, y0, x1, y1 = (float(value) for value in text)
+            except ValueError:
+                if quiet:
+                    continue
+                raise ValueError(
+                    f"{name}: the rectangle needs four numbers: x0 y0 x1 y1."
+                )
+            if not all(0.0 <= value <= 1.0 for value in (x0, y0, x1, y1)):
+                if quiet:
+                    continue
+                raise ValueError(f"{name}: the rectangle must be inside 0..1 of the frame.")
+            if x1 <= x0 or y1 <= y0:
+                if quiet:
+                    continue
+                raise ValueError(f"{name}: the rectangle must have a positive width and height.")
+            points = row.get("points") or []
+            if not points or str(row["rect"].get()).strip() != row.get("original_rect", ""):
+                points = [[x0, y0], [x1, y0], [x1, y1], [x0, y1]]
+            count_text = str(row["count"].get()).strip()
+            try:
+                n_animals = int(count_text) if count_text else 0
+            except ValueError:
+                if quiet:
+                    n_animals = 0
+                else:
+                    raise ValueError(f"{name}: the number of animals must be an integer.")
+            if n_animals < 0:
+                if quiet:
+                    continue
+                raise ValueError(f"{name}: the number of animals must not be negative.")
+            population = str(row["mode"].get()).strip() or _POPULATION_CROWDED
+            rois.append({
+                "enabled": True,
+                "name": name,
+                "shape": str(row.get("shape", "") or "rectangle"),
+                "points_normalized": [[float(x), float(y)] for x, y in points],
+                "frame_start": 0,
+                "frame_end": -1,
+                "n_animals": n_animals,
+                "population": normalize_population_mode(population, n_animals),
+            })
+        return rois
+
+    def _restore_analysis_rois_from_config(self, cfg: dict) -> None:
+        """Show the ROIs of a loaded configuration in the ROI editor.
+
+        The ROIs are part of the configuration, so a load followed by a save
+        must not drop them.
+        """
+        rois = cfg.get("ROI_SETS") or []
+        if not rois and isinstance(cfg.get("TANKS"), list):
+            rois = [
+                {
+                    "name": str(tank.get("name", "") or ""),
+                    "shape": "rectangle",
+                    "points_normalized": tank.get("polygon") or [],
+                    "n_animals": int(tank.get("fish_count", 0) or 0),
+                    "population": str(tank.get("population", "") or _POPULATION_CROWDED),
+                }
+                for tank in cfg["TANKS"]
+                if isinstance(tank, dict)
+            ]
+        self._clear_analysis_roi_rows()
+        for index, roi in enumerate(rois):
+            if not isinstance(roi, dict):
+                continue
+            points = [
+                [float(point[0]), float(point[1])]
+                for point in (roi.get("points_normalized") or [])
+                if isinstance(point, (list, tuple)) and len(point) >= 2
+            ]
+            if len(points) < 3:
+                continue
+            self._add_analysis_roi_row({
+                "enabled": bool(roi.get("enabled", True)),
+                "name": str(roi.get("name", "") or "").strip() or f"Arena{index + 1}",
+                "shape": str(roi.get("shape", "") or "rectangle"),
+                "n_animals": int(roi.get("n_animals", 0) or 0),
+                "population": roi.get("population", _POPULATION_CROWDED),
+                "points_normalized": points,
+            })
+        if self._analysis_roi_rows:
+            self._analysis_roi_use.set(True)
+            self._analysis_roi_per_arena.set(bool(cfg.get("TANKS")))
+        self._update_analysis_roi_summary()
+
+    @staticmethod
+    def _arena_roster_entries(rois: list[dict]) -> list[dict]:
+        """Return the tank roster that gives every ROI its own run.
+
+        One arena per ROI means the pipeline tracks only the fish of that ROI
+        and numbers them on their own, so a fish of the second arena is
+        ``Arena2-ID1`` and never mixed up with a fish of the first one.
+        """
+        tanks: list[dict] = []
+        used_ids: set[str] = set()
+        for index, roi in enumerate(rois or []):
+            points = [list(point) for point in (roi.get("points_normalized") or [])]
+            if len(points) < 3:
+                continue
+            name = str(roi.get("name", "") or "").strip() or f"Arena{index + 1}"
+            arena_id = _arena_id(name, index)
+            while arena_id in used_ids:
+                arena_id = f"{arena_id}_{index + 1}"
+            used_ids.add(arena_id)
+            entry = {
+                "id": arena_id,
+                "name": name,
+                "view": "top",
+                "population": str(roi.get("population", "") or _POPULATION_CROWDED),
+                "polygon": [[float(x), float(y)] for x, y in points],
+            }
+            count = int(roi.get("n_animals", 0) or 0)
+            if count > 0:
+                # An arena that declares no number of fish keeps the number of
+                # the configuration asks for.
+                entry["fish_count"] = count
+            tanks.append(entry)
+        return tanks
+
+    def _load_analysis_rois_from_segmentation(self) -> None:
+        """Take the ROIs of the segmentation step, so the analysis can use them."""
+        session = self._get_session()
+        video = self._video_entry.get().strip()
+        if not session:
+            messagebox.showwarning("No session", "Please select a session first.")
+            return
+        seg_dir = os.path.join(session, "segmentation")
+        config_path = os.path.join(seg_dir, "segmentation_gui_config.json")
+        if not os.path.isfile(config_path):
+            messagebox.showwarning(
+                "No segmentation settings",
+                f"No segmentation settings were found at {config_path}.",
+            )
+            return
+        try:
+            with open(config_path, "r", encoding="utf-8") as file:
+                payload = json.load(file)
+        except (OSError, ValueError) as exc:
+            messagebox.showerror("Segmentation settings", f"Could not read the file:\n{exc}")
+            return
+        settings = payload.get("settings", payload) if isinstance(payload, dict) else {}
+        roi_sets = settings.get("roi_sets", []) if isinstance(settings, dict) else []
+        image_shape = None
+        dims = self._video_dims(video) if video else (0, 0)
+        if dims and dims[0] > 0 and dims[1] > 0:
+            image_shape = (dims[1], dims[0])
+        self._clear_analysis_roi_rows()
+        try:
+            normalized_sets, _reverse = load_roi_settings(
+                {"roi_sets": roi_sets}, image_shape,
+            )
+        except ValueError as exc:
+            messagebox.showerror("Segmentation settings", str(exc))
+            return
+        for index, roi in enumerate(normalized_sets):
+            if not roi.get("enabled", False):
+                continue
+            points = _normalized_roi_points(roi.get("points") or [], image_shape)
+            if not points:
+                continue
+            self._add_analysis_roi_row({
+                "enabled": True,
+                "name": str(roi.get("name", "") or "").strip() or f"Arena{index + 1}",
+                "shape": str(roi.get("shape", "") or "rectangle"),
+                "n_animals": int(roi.get("n_animals", 0) or 0),
+                "population": roi.get("population", _POPULATION_CROWDED),
+                "points_normalized": points,
+            })
+        self._analysis_roi_use.set(bool(self._analysis_roi_rows))
+        self._update_analysis_roi_summary()
+
+    def _build_questions_section(self, parent: ctk.CTkScrollableFrame) -> None:
+        self._step2_tab = ctk.CTkButton(
+            parent, text="▾  Step 2: Settings", height=30,
+            fg_color="#343434", hover_color="#464646",
+            command=self._toggle_step2_details,
+            anchor="w",
+        )
+        frame = ctk.CTkFrame(parent, corner_radius=6)
+        self._settings_frame = frame
+        frame.pack(fill="x", padx=12, pady=5)
+        inner = ctk.CTkFrame(frame, corner_radius=0)
+        inner.pack(fill="x", padx=8, pady=(6, 10))
+        question_label_width = 300
+        question_option_gap = 14
+        first_choice_width = 104
+        radio_gap = 6
+
+        def pack_question_label(parent, text):
+            ctk.CTkLabel(parent, text=text, width=question_label_width, anchor="w").pack(
+                side="left",
+                padx=(0, question_option_gap),
+            )
+
+        def pack_radio(parent, text, var, value, *, width, command=None, gap=None):
+            padx_right = radio_gap if gap is None else int(gap)
+            radio = ctk.CTkRadioButton(
+                parent,
+                text=text,
+                variable=var,
+                value=value,
+                command=command,
+                width=width,
+            )
+            radio.pack(side="left", padx=(0, padx_right))
+            return radio
+
+        # Align all checkboxes with the first radio choice in the shared
+        # question-label column layout.
+        row = ctk.CTkFrame(inner, corner_radius=0)
+        row.pack(fill="x", pady=4)
+        pack_question_label(row, "")
+        self._direction_mode_checkbox = ctk.CTkCheckBox(
+            row,
+            text="Without direction estimation [Beta]",
+            variable=self._without_direction,
+        )
+        self._direction_mode_checkbox.pack(side="left")
+
+        self._delete_tmp_files = tk.BooleanVar(value=True)
+        row = ctk.CTkFrame(inner, corner_radius=0)
+        row.pack(fill="x", pady=4)
+        pack_question_label(row, "")
+        ctk.CTkCheckBox(
+            row,
+            text="Delete tmp files",
+            variable=self._delete_tmp_files,
+            width=150,
+        ).pack(side="left")
+
+        # Animals count
+        row = ctk.CTkFrame(inner, corner_radius=0)
+        row.pack(fill="x", pady=4)
+        pack_question_label(row, "How many fish are in the video?")
+        self._num_objects_sb = dark_spinbox(
+            row,
+            from_=1,
+            to=999,
+            increment=1,
+            width=6,
+            command=self._invalidate_num_confirm,
+            **_SPIN_CFG,
+        )
+        self._num_objects_sb.pack(side="left", padx=5)
+        self._num_objects_sb.delete(0, tk.END)
+        self._num_objects_sb.insert(0, "1")
+        self._num_objects_sb.bind("<Return>", lambda _e: self._confirm_num_objects(), add="+")
+        self._num_objects_sb.bind("<KP_Enter>", lambda _e: self._confirm_num_objects(), add="+")
+        self._num_objects_sb.bind("<KeyRelease>", self._on_num_objects_key_release, add="+")
+        self._num_enter_button = ctk.CTkButton(
+            row, text="Enter", width=70, command=self._confirm_num_objects,
+            border_width=3, border_color="#777777",
+        )
+        self._num_enter_button.pack(side="left", padx=(6, 8))
+        self._num_confirm_hint = ctk.CTkLabel(row, text="Press Enter to confirm", text_color="gray", anchor="w")
+        self._num_confirm_hint.pack(side="left")
+
+        row = ctk.CTkFrame(inner, corner_radius=0)
+        row.pack(fill="x", pady=4)
+        pack_question_label(row, "")
+        ctk.CTkCheckBox(
+            row,
+            text="Variable population [Beta]",
+            variable=self._variable_count,
+            command=self._on_variable_count_changed,
+        ).pack(side="left")
+
+        row = ctk.CTkFrame(inner, corner_radius=0)
+        row.pack(fill="x", pady=4)
+        pack_question_label(row, "")
+        self._single_animal_paste = tk.BooleanVar(value=False)
+        self._single_animal_paste_checkbox = ctk.CTkCheckBox(
+            row,
+            text="Use paste augmentation when fish = 1",
+            variable=self._single_animal_paste,
+            command=self._on_single_animal_paste_changed,
+        )
+        self._single_animal_paste_checkbox.pack(side="left")
+
+        self._build_analysis_roi_section(inner)
+
+        # Overlap
+        row = ctk.CTkFrame(inner, corner_radius=0)
+        row.pack(fill="x", pady=4)
+        pack_question_label(row, "How severe is the overlap?")
+        self._overlap = tk.StringVar(value="heavy")
+        for text, val, width, gap in [
+            ("Very heavy", "super_heavy", first_choice_width, radio_gap),
+            ("Heavy", "heavy", 66, 14),
+            ("Light", "light", 66, radio_gap),
+            ("None", "none", 66, radio_gap),
+        ]:
+            command = self._show_super_heavy_overlap_warning if val == "super_heavy" else None
+            self._overlap_radios.append(
+                pack_radio(row, text, self._overlap, val, width=width, command=command, gap=gap)
+            )
+
+        # Backward movement
+        row = ctk.CTkFrame(inner, corner_radius=0)
+        row.pack(fill="x", pady=4)
+        pack_question_label(row, "Do the fish ever move backward?")
+        self._backward_movement = tk.StringVar(value="no")
+        self._backward_movement.trace_add("write", lambda *_: self._sync_refine_skip_from_backward_question())
+        self._backward_radios = []
+        for text, val in [("Yes", "yes"), ("No", "no")]:
+            width = first_choice_width if val == "yes" else 66
+            self._backward_radios.append(
+                pack_radio(row, text, self._backward_movement, val, width=width))
+        self._apply_backward_question_state()
+
+        # Paste / cluster controls (advanced)
+        row = ctk.CTkFrame(inner, corner_radius=0)
+        row.pack(fill="x", pady=4)
+        pack_question_label(row, "Paste per frame")
+        self._paste_count_sb = dark_spinbox(
+            row, from_=1, to=200, increment=1, width=6,
+            command=lambda: self._on_paste_count_changed(self._paste_count_sb.get()),
+            **_SPIN_CFG,
+        )
+        self._paste_count_sb.pack(side="left", padx=5)
+        self._paste_count_sb.delete(0, tk.END)
+        self._paste_count_sb.insert(0, "12")
+
+        row = ctk.CTkFrame(inner, corner_radius=0)
+        row.pack(fill="x", pady=4)
+        pack_question_label(row, "Cluster frames")
+        self._cluster_frames_sb = dark_spinbox(
+            row, from_=1, to=200, increment=1, width=6,
+            command=lambda: self._on_cluster_frames_changed(self._cluster_frames_sb.get()),
+            **_SPIN_CFG,
+        )
+        self._cluster_frames_sb.pack(side="left", padx=5)
+        self._cluster_frames_sb.delete(0, tk.END)
+        self._cluster_frames_sb.insert(0, "12")
+
+        row = ctk.CTkFrame(inner, corner_radius=0)
+        row.pack(fill="x", pady=4)
+        pack_question_label(row, "Crops per frame")
+        self._crop_count_sb = dark_spinbox(
+            row, from_=1, to=500, increment=1, width=6,
+            command=lambda: self._on_crop_count_changed(self._crop_count_sb.get()),
+            **_SPIN_CFG,
+        )
+        self._crop_count_sb.pack(side="left", padx=5)
+        self._crop_count_sb.delete(0, tk.END)
+        self._crop_count_sb.insert(0, "12")
+
+        row = ctk.CTkFrame(inner, corner_radius=0)
+        row.pack(fill="x", pady=4)
+        pack_question_label(row, "Max paste per frame")
+        self._max_paste_sb = dark_spinbox(
+            row, from_=1, to=50, increment=1, width=6,
+            command=lambda: self._on_max_paste_changed(self._max_paste_sb.get()),
+            **_SPIN_CFG,
+        )
+        self._max_paste_sb.pack(side="left", padx=5)
+        self._max_paste_sb.delete(0, tk.END)
+        self._max_paste_sb.insert(0, "5")
+
+        row = ctk.CTkFrame(inner, corner_radius=0)
+        row.pack(fill="x", pady=4)
+        pack_question_label(row, "Total training images")
+        self._num_images_sb = dark_spinbox(
+            row, from_=1000, to=50000, increment=100, width=6,
+            command=lambda: self._on_num_images_changed(self._num_images_sb.get()),
+            **_SPIN_CFG,
+        )
+        self._num_images_sb.pack(side="left", padx=5)
+        self._num_images_sb.delete(0, tk.END)
+        self._num_images_sb.insert(0, "5000")
+
+    def _on_paste_count_changed(self, val: str) -> None:
+        self._easy_answers["PASTE_COUNT"] = val
+
+    def _on_cluster_frames_changed(self, val: str) -> None:
+        self._easy_answers["CLUSTER_FRAMES"] = val
+
+    def _on_crop_count_changed(self, val: str) -> None:
+        self._easy_answers["CROP_COUNT"] = val
+
+    def _on_max_paste_changed(self, val: str) -> None:
+        self._easy_answers["MAX_PASTE_PER_FRAME"] = val
+
+    def _on_num_images_changed(self, val: str) -> None:
+        self._easy_answers["NUM_IMAGES"] = val
+
+        self._apply_individual_count_state()
+
+    def _show_super_heavy_overlap_warning(self) -> None:
+        messagebox.showwarning(
+            "Very Heavy Overlap",
+            "Very heavy overlap uses contrastive learning and can take a long time.\n\n"
+            "Press OK to continue.",
+            parent=self,
+        )
+
+    # Action buttons
+    def _build_action_buttons(self, parent: ctk.CTkScrollableFrame) -> None:
+        frame = ctk.CTkFrame(parent, corner_radius=0)
+        self._action_frame = frame
+        frame.pack(fill="x", padx=12, pady=8)
+
+        row1 = ctk.CTkFrame(frame, corner_radius=0)
+        self._action_row = row1
+        row1.pack(fill="x")
+
+        self._run_btn = ctk.CTkButton(
+            row1, text="Processing", width=180, height=42,
+            font=("TkDefaultFont", 13, "bold"), command=self._run_easy_tracking,
+            border_width=3, border_color="#777777",
+        )
+        self._run_btn.pack(side="left", padx=(0, 10))
+
+        self._stop_btn = ctk.CTkButton(
+            row1, text="Stop", width=100, height=42,
+            state="disabled",
+            fg_color="#8b1a1a", hover_color="#a02020",
+            command=self._stop_batch,
+        )
+        self._stop_btn.pack(side="right")
+
+    def _open_results(self) -> None:
+        try:
+            open_results_directory(
+                self._get_session(),
+                without_direction_estimation=self._without_direction.get(),
+            )
+        except (OSError, ValueError) as exc:
+            messagebox.showwarning("Open results", str(exc), parent=self)
+
+    # Progress section
+    def _build_progress_section(self, parent: ctk.CTkScrollableFrame) -> None:
+        self._progress_host = ctk.CTkFrame(parent, fg_color="transparent")
+        self._progress_host.pack(fill="x", padx=12, pady=(5, 14))
+        self._progress_tab = ctk.CTkButton(
+            self._progress_host, text="▸  Progress", height=30,
+            fg_color="#343434", hover_color="#464646",
+            command=self._toggle_progress_details,
+            anchor="w",
+        )
+        self._progress_tab.pack(fill="x")
+        frame = ctk.CTkFrame(self._progress_host, corner_radius=6)
+        self._progress_frame = frame
+        frame.pack(fill="x", pady=(2, 0))
+
+        # Overall progress bar
+        pb_wrap = ctk.CTkFrame(frame, corner_radius=0)
+        pb_wrap.pack(fill="x", padx=8, pady=4)
+        self._progress_canvas = tk.Canvas(pb_wrap, height=30, bg="#1e1e1e", highlightthickness=0)
+        self._progress_canvas.pack(fill="x")
+        self._progress_canvas.bind("<Configure>", lambda _e: self._redraw_progress())
+        self._progress_pct: float = 0.0
+        self._progress_text: str = "Idle"
+
+        # Process blocks
+        self._blocks_wrap = ctk.CTkFrame(frame, corner_radius=0, fg_color="#1e1e1e")
+        self._blocks_wrap.pack(fill="x", padx=8, pady=4)
+        self._blocks_row: tk.Frame | None = None
+        self._render_blocks([])
+
+        self._build_preview_folder_panel(frame)
+
+    def _build_preview_folder_panel(self, parent: ctk.CTkFrame) -> None:
+        wrap = ctk.CTkFrame(parent, corner_radius=0)
+        wrap.pack(fill="x", padx=8, pady=(0, 10))
+
+        self._open_results_btn = ctk.CTkButton(
+            self._action_row, text="Open results", height=36,
+            command=self._open_results,
+            border_width=3, border_color="#777777",
+        )
+
+        ctk.CTkLabel(
+            wrap,
+            text="Preview folders",
+            font=("TkDefaultFont", 12, "bold"),
+            anchor="w",
+        ).grid(row=1, column=0, columnspan=3, sticky="ew", pady=(0, 4))
+
+        labels = [
+            ("single_animal", "Single fish"),
+            ("refine_blobs", "Refine blobs"),
+            ("clustered_paste", "Clustered paste"),
+            ("mixed_paste", "Mixed paste"),
+            ("cropped_images", "Cropped images"),
+            ("detection", "Detection"),
+        ]
+        for col in range(3):
+            wrap.grid_columnconfigure(col, weight=1, uniform="preview_folder")
+        for index, (key, label) in enumerate(labels):
+            button = ctk.CTkButton(
+                wrap,
+                text=label,
+                height=30,
+                state="disabled",
+                command=lambda k=key: self._open_preview_folder(k),
+            )
+            button.grid(
+                row=2 + index // 3,
+                column=index % 3,
+                sticky="ew",
+                padx=(0 if index % 3 == 0 else 3, 0 if index % 3 == 2 else 3),
+                pady=3,
+            )
+            self._preview_folder_buttons[key] = button
+
+    def _preview_folder_patterns(self, session: str) -> dict[str, list[str]]:
+        if not session:
+            return {}
+        detection_parts = [
+            session, OUTPUT_ROOT_DIR, "*", "tracking", "dataset*", "*", "*"
+        ]
+        if self._variable_count.get():
+            detection_parts.append("variable")
+        detection_parts.append("preview")
+        return {
+            "single_animal": [
+                os.path.join(session, "single_animal_images", "preview"),
+            ],
+            "refine_blobs": [
+                os.path.join(session, "single_animal_images", "refine", "dataset", "preview"),
+                os.path.join(session, "single_animal_images", "refine_add*", "dataset", "preview"),
+            ],
+            "clustered_paste": [
+                os.path.join(session, "paste_blobs_clustered", "preview"),
+            ],
+            "mixed_paste": [
+                os.path.join(session, "paste_blobs", "preview"),
+            ],
+            "cropped_images": [
+                os.path.join(session, "paste_blobs", "cropping", "preview"),
+                os.path.join(session, "paste_blobs_clustered", "cropping", "preview"),
+                os.path.join(session, "single_animal_images", "cropping", "preview"),
+            ],
+            "detection": [
+                os.path.join(*detection_parts),
+            ],
+        }
+
+    @staticmethod
+    def _latest_nonempty_preview_dir(patterns: list[str]) -> str:
+        latest_dir = ""
+        latest_mtime = -1.0
+        image_suffixes = (".png", ".jpg", ".jpeg")
+        for pattern in patterns:
+            for directory in sorted(glob.glob(pattern)):
+                if not os.path.isdir(directory):
+                    continue
+                try:
+                    names = os.listdir(directory)
+                except OSError:
+                    continue
+                for name in names:
+                    path = os.path.join(directory, name)
+                    if not name.lower().endswith(image_suffixes) or not os.path.isfile(path):
+                        continue
+                    try:
+                        mtime = os.path.getmtime(path)
+                    except OSError:
+                        continue
+                    if mtime >= latest_mtime:
+                        latest_mtime = mtime
+                        latest_dir = directory
+        return latest_dir
+
+    def _refresh_preview_folder_buttons(self) -> None:
+        session = self._get_session()
+        if hasattr(self, "_action_glows") and self._action_glows:
+            self._set_post_segmentation_visibility(self._workflow_segmentation_ready)
+        resolved: dict[str, str] = {}
+        patterns = self._preview_folder_patterns(session)
+        for key, button in self._preview_folder_buttons.items():
+            path = self._latest_nonempty_preview_dir(patterns.get(key, []))
+            if path:
+                resolved[key] = path
+                button.configure(state="normal")
+            else:
+                button.configure(state="disabled")
+        self._preview_folder_paths = resolved
+
+        if self.winfo_exists():
+            self._preview_folder_poll_id = self.after(
+                1000, self._refresh_preview_folder_buttons
+            )
+
+    def _open_preview_folder(self, key: str) -> None:
+        patterns = self._preview_folder_patterns(self._get_session())
+        path = self._latest_nonempty_preview_dir(patterns.get(key, []))
+        if not path:
+            self._preview_folder_paths.pop(key, None)
+            button = self._preview_folder_buttons.get(key)
+            if button is not None:
+                button.configure(state="disabled")
+            return
+
+        self._preview_folder_paths[key] = path
+        try:
+            if os.name == "nt":
+                os.startfile(path)
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", path])
+            else:
+                subprocess.Popen(["xdg-open", path])
+        except OSError as exc:
+            messagebox.showwarning(
+                "Open preview folder",
+                f"Could not open the preview folder.\n\n{exc}",
+                parent=self,
+            )
+
+    # Canvas panel - visual progress
+    def _build_canvas_panel(self, parent: tk.Frame) -> None:
+        parent.grid_rowconfigure(2, weight=1)
+        parent.grid_columnconfigure(0, weight=1)
+
+        hdr = tk.Frame(parent, bg="#222222")
+        hdr.grid(row=0, column=0, sticky="ew")
+        tk.Label(hdr, text="Visual Progress", bg="#222222", fg="#cccccc",
+                 font=_VISUAL_PROGRESS_TITLE_FONT).pack(side="left", padx=10, pady=5)
+
+        self._display_canvas = tk.Canvas(parent, bg="#1a1a1a", highlightthickness=0)
+        self._display_canvas.grid(row=2, column=0, sticky="nsew", padx=4, pady=4)
+        self._display_canvas.bind("<Configure>", lambda _e: self._on_canvas_resize())
+
+        self._next_action_label = tk.Label(
+            parent,
+            text="",
+            bg="#202820",
+            fg="#d7eadc",
+            font=_VISUAL_PROGRESS_FONT,
+            wraplength=600,
+            justify="left",
+            anchor="w",
+            padx=10,
+            pady=8,
+        )
+        self._next_action_label.grid(row=1, column=0, sticky="ew", padx=4, pady=(4, 0))
+        self._next_action_label.bind("<Configure>", self._wrap_canvas_panel_label)
+
+        self._canvas_status = tk.Label(
+            parent, text="Waiting for processing to start...",
+            bg="#0D1216", fg="#93A1AC", font=_VISUAL_PROGRESS_FONT,
+            wraplength=600, justify="center",
+        )
+        self._canvas_status.grid(row=3, column=0, sticky="ew", padx=8, pady=(0, 6))
+        self._canvas_status.bind("<Configure>", self._wrap_canvas_panel_label)
+        self.after_idle(self._update_next_action)
+
+    def _wrap_canvas_panel_label(self, event: tk.Event) -> None:
+        label = event.widget
+        def _as_int(v):
+            try:
+                return int(str(v))
+            except Exception:
+                return 0
+        inset = 2 * sum(_as_int(label.cget(option)) for option in ("padx", "borderwidth", "highlightthickness"))
+        wraplength = max(1, event.width - inset)
+        if _as_int(label.cget("wraplength")) != wraplength:
+            label.configure(wraplength=wraplength)
+
+    def _update_next_action(self) -> None:
+        if not hasattr(self, "_next_action_label"):
+            return
+
+        batch_running = self._batch_proc is not None and self._batch_proc.poll() is None
+        if batch_running or self._last_run_state == "running":
+            message = "Have a cup of tea and take a break."
+        elif not self._video_entry.get().strip():
+            message = "1. Select a training video."
+        elif (
+            self._seg_proc is not None
+            and self._seg_proc.poll() is None
+            and not self._segmentation_finished_for_current_launch()
+        ):
+            message = "2. Complete segmentation, then return to Easy Tracking."
+        elif not self._segmentation_outputs_exist():
+            message = "2. Click Launch Segmentation and complete segmentation."
+        elif self._last_run_state == "complete":
+            message = "Processing is complete. Click Open results to view the results."
+        elif self._last_run_state == "failed":
+            message = "Processing failed. Review the error and log, then click Processing to retry."
+        elif self._last_run_state == "stopped":
+            message = "Processing was stopped. Update the settings as needed, then click Processing to resume."
+        elif not self._variable_count.get() and not self._num_confirmed:
+            message = "3. Set the number of fish and press Enter."
+        elif self._single_animal_skips_paste():
+            message = "4. Click Processing. No further setup is required for a single fish."
+        elif self._without_direction.get():
+            message = "4. Answer how severe the overlap is, then click Processing."
+        else:
+            message = (
+                "4. Answer the overlap and backward-movement questions, "
+                "then click Processing."
+            )
+
+        self._next_action_label.configure(text=f"Next action\n{message}")
+
+    def _on_canvas_resize(self) -> None:
+        cc = self._canvas_content
+        if cc.get("type") == "image":
+            self._show_image_on_canvas(cc["path"], cc.get("caption", ""))
+        elif cc.get("type") == "chart":
+            self._render_line_chart(
+                self._display_canvas,
+                cc["values"], cc["title"], cc.get("x_label", ""), cc.get("color", "#3B82F6"),
+                x_values=cc.get("x_values"),
+            )
+        elif cc.get("type") == "multi_chart":
+            self._render_multi_line_chart(
+                self._display_canvas,
+                cc["series"], cc["title"], cc.get("x_label", ""),
+            )
+        elif cc.get("type") == "dual_chart":
+            self._render_dual_chart(cc["data"])
+        elif cc.get("type") == "training_monitor":
+            self._render_training_monitor(cc["data"])
+        else:
+            self._draw_placeholder(cc.get("msg", "Waiting for processing to start..."))
+
+    def _draw_placeholder(self, msg: str = "Waiting for processing to start...") -> None:
+        self._canvas_content = {"type": "placeholder", "msg": msg}
+        c = self._display_canvas
+        c.delete("all")
+        w = max(c.winfo_width(), 100)
+        h = max(c.winfo_height(), 100)
+        c.create_rectangle(0, 0, w, h, fill="#1a1a1a", outline="")
+        c.create_text(w // 2, h // 2, text=msg, fill="#999999",
+                      font=_VISUAL_PROGRESS_FONT, justify="center",
+                      width=w - 40, anchor="center")
+
+    def _show_image_on_canvas(self, path: str, caption: str = "") -> None:
+        c = self._display_canvas
+        cw = max(c.winfo_width(), 100)
+        ch = max(c.winfo_height(), 100)
+        try:
+            from PIL import Image, ImageTk
+            img = Image.open(path)
+            iw, ih = img.size
+            scale = min(cw / iw, ch / ih)
+            new_w = int(round(iw * scale))
+            new_h = int(round(ih * scale))
+            img = img.resize((new_w, new_h), Image.LANCZOS)
+            x = (cw - new_w) // 2
+            y = (ch - new_h) // 2
+            photo = ImageTk.PhotoImage(img)
+            c.delete("all")
+            c.create_rectangle(0, 0, cw, ch, fill="#1a1a1a", outline="")
+            c.create_image(x, y, anchor="nw", image=photo)
+            self._display_photo = photo        # prevent GC
+            self._last_display_img = path
+            self._canvas_content = {"type": "image", "path": path, "caption": caption}
+        except Exception:
+            pass  # Keep previous canvas content if image load fails
+
+    # Line chart (drawn directly on a tk.Canvas, no matplotlib)
+
+    def _draw_loss_chart(self, values: list, title: str,
+                         x_label: str = "", color: str = "#3B82F6",
+                         x_values: list[int] | None = None) -> None:
+        self._canvas_content = {
+            "type": "chart", "values": values, "title": title,
+            "x_label": x_label, "color": color, "x_values": x_values,
+        }
+        self._display_canvas.delete("all")
+        self._render_line_chart(
+            self._display_canvas, values, title, x_label, color, x_values=x_values,
+        )
+
+    def _render_line_chart(
+        self, canvas: tk.Canvas, values: list, title: str,
+        x_label: str, color: str,
+        y_offset: int = 0, panel_height: int = 0,
+        x_offset: int = 0, panel_width: int = 0,
+        tick_decimals: int | None = None,
+        x_values: list[int] | None = None,
+    ) -> None:
+        full_width = max(canvas.winfo_width(), 100)
+        cw = panel_width or full_width
+        ph = panel_height or max(canvas.winfo_height(), 100)
+
+        ml, mr, mt, mb = 64, 8, 28, 36
+        plot_left = x_offset + ml
+        pw = cw - ml - mr
+        ph_inner = ph - mt - mb
+
+        if not values or pw < 20 or ph_inner < 20:
+            return
+
+        min_v = min(values)
+        max_v = max(values)
+        rng = (max_v - min_v) or 1e-8
+        n = len(values)
+        sample_axis = x_values if x_values is not None and len(x_values) == n else None
+        x_max = max(sample_axis) if sample_axis else 0
+
+        def px(i: int) -> int:
+            position = sample_axis[i] / max(1, x_max) if sample_axis else i / max(n - 1, 1)
+            return plot_left + int(position * pw)
+
+        def py(v: float) -> int:
+            return y_offset + mt + int((1 - (v - min_v) / rng) * ph_inner)
+
+        canvas.create_rectangle(
+            x_offset, y_offset, x_offset + cw, y_offset + ph,
+            fill="#1a1a1a", outline="",
+        )
+        canvas.create_text(
+            x_offset + cw // 2, y_offset + 11, text=title,
+            fill="#cccccc", font=_VISUAL_PROGRESS_TITLE_FONT, anchor="center",
+        )
+
+        for frac in (0.0, 0.5, 1.0):
+            v = min_v + frac * rng
+            y = py(v)
+            canvas.create_line(plot_left, y, plot_left + pw, y, fill="#272727", dash=(3, 5))
+            if tick_decimals is not None:
+                lbl = f"{v:.{tick_decimals}f}"
+            else:
+                lbl = f"{v:.3g}" if abs(v) < 1e4 else f"{v:.2e}"
+            canvas.create_text(
+                plot_left - 3, y, text=lbl,
+                fill="#888888", font=_VISUAL_PROGRESS_FONT, anchor="e",
+            )
+
+        axis_y = y_offset + mt + ph_inner
+        canvas.create_line(plot_left, y_offset + mt, plot_left, axis_y, fill="#555", width=1)
+        canvas.create_line(plot_left, axis_y, plot_left + pw, axis_y, fill="#555", width=1)
+        canvas.create_text(
+            plot_left, axis_y + 4, text="0",
+            fill="#888888", font=_VISUAL_PROGRESS_FONT, anchor="n",
+        )
+        canvas.create_text(
+            plot_left + pw, axis_y + 4, text=str(x_max if sample_axis else n - 1),
+            fill="#888888", font=_VISUAL_PROGRESS_FONT, anchor="ne",
+        )
+        if x_label:
+            canvas.create_text(
+                plot_left + pw // 2, axis_y + 14,
+                text=x_label, fill="#93A1AC", font=_VISUAL_PROGRESS_FONT, anchor="n",
+            )
+
+        if n >= 2:
+            pts = []
+            for i, v in enumerate(values):
+                pts.append(px(i))
+                pts.append(py(v))
+            canvas.create_line(pts, fill=color, width=3, smooth=True)
+        elif n == 1:
+            x0, y0 = px(0), py(values[0])
+            canvas.create_oval(x0 - 3, y0 - 3, x0 + 3, y0 + 3, fill=color, outline="")
+
+    def _render_multi_line_chart(
+        self, canvas: tk.Canvas, series: list, title: str,
+        x_label: str = "",
+        y_offset: int = 0, panel_height: int = 0,
+        subtitle: str = "",
+        tick_decimals: int | None = None,
+        x_values: list[int] | None = None,
+        history_count: int = 0,
+        show_legend: bool = True,
+    ) -> None:
+        """Draw series on shared axes, optionally separating saved epoch means."""
+        cw = max(canvas.winfo_width(), 100)
+        ph = panel_height or max(canvas.winfo_height(), 100)
+
+        ml, mr = 64, 8
+        mt = 48 if subtitle else 28
+        mb = 36
+        pw = cw - ml - mr
+
+        valid_series = [(vals, col, lbl) for vals, col, lbl in series if vals]
+        if not valid_series or pw < 20:
+            return
+
+        canvas.create_rectangle(0, y_offset, cw, y_offset + ph, fill="#1a1a1a", outline="")
+        canvas.create_text(
+            cw // 2, y_offset + 11, text=title,
+            fill="#cccccc", font=_VISUAL_PROGRESS_TITLE_FONT, anchor="center",
+        )
+        if subtitle:
+            subtitle_item = canvas.create_text(
+                cw // 2, y_offset + 23, text=subtitle,
+                fill="#999999", font=_VISUAL_PROGRESS_FONT, anchor="n",
+                width=max(1, cw - 24), justify="center",
+            )
+            mt = max(mt, canvas.bbox(subtitle_item)[3] - y_offset + 10)
+        ph_inner = ph - mt - mb
+        if ph_inner < 20:
+            return
+
+        all_vals = [v for vals, _, _ in valid_series for v in vals]
+        min_v = min(all_vals)
+        max_v = max(all_vals)
+        rng = (max_v - min_v) or 1e-8
+        n_max = max(len(vals) for vals, _, _ in valid_series)
+        sample_axis = x_values if x_values and len(x_values) == n_max else None
+        x_max = max(sample_axis) if sample_axis else 0
+
+        def px(i: int, n: int) -> int:
+            position = sample_axis[i] / max(1, x_max) if sample_axis else i / max(n - 1, 1)
+            return ml + int(position * pw)
+
+        def py(v: float) -> int:
+            return y_offset + mt + int((1 - (v - min_v) / rng) * ph_inner)
+
+        for frac in (0.0, 0.5, 1.0):
+            v = min_v + frac * rng
+            y = py(v)
+            canvas.create_line(ml, y, ml + pw, y, fill="#272727", dash=(3, 5))
+            if tick_decimals is not None:
+                lbl = f"{v:.{tick_decimals}f}"
+            else:
+                lbl = f"{v:.3g}" if abs(v) < 1e4 else f"{v:.2e}"
+            canvas.create_text(
+                ml - 3, y, text=lbl, fill="#888888",
+                font=_VISUAL_PROGRESS_FONT, anchor="e",
+            )
+
+        axis_y = y_offset + mt + ph_inner
+        canvas.create_line(ml, y_offset + mt, ml, axis_y, fill="#555", width=1)
+        canvas.create_line(ml, axis_y, ml + pw, axis_y, fill="#555", width=1)
+        canvas.create_text(
+            ml, axis_y + 4, text="0", fill="#888888",
+            font=_VISUAL_PROGRESS_FONT, anchor="n",
+        )
+        canvas.create_text(
+            ml + pw, axis_y + 4, text=str(x_max if sample_axis else n_max - 1),
+            fill="#888888", font=_VISUAL_PROGRESS_FONT, anchor="ne",
+        )
+        if x_label:
+            canvas.create_text(
+                ml + pw // 2, axis_y + 14,
+                text=x_label, fill="#93A1AC", font=_VISUAL_PROGRESS_FONT, anchor="n",
+            )
+
+        for vals, color, label in valid_series:
+            n = len(vals)
+            cutoff = min(max(0, history_count), n) if not show_legend else 0
+            segments = (
+                [(0, cutoff, "#87a793"), (max(0, cutoff - 1), n, color)]
+                if 0 < cutoff < n else [(0, n, "#87a793")]
+                if cutoff else [(0, n, color)]
+            )
+            for start, stop, segment_color in segments:
+                if stop - start >= 2:
+                    pts = []
+                    for i in range(start, stop):
+                        pts.extend((px(i, n), py(vals[i])))
+                    canvas.create_line(pts, fill=segment_color, width=3, smooth=True)
+                elif stop - start == 1:
+                    x0, y0 = px(start, n), py(vals[start])
+                    canvas.create_oval(x0 - 3, y0 - 3, x0 + 3, y0 + 3,
+                                      fill=segment_color, outline="")
+
+        if show_legend:
+            ly = y_offset + mt + 8
+            for vals, color, label in valid_series:
+                lx = ml + pw - 4
+                canvas.create_line(lx - 18, ly + 4, lx - 4, ly + 4, fill=color, width=3)
+                canvas.create_text(
+                    lx - 22, ly + 4, text=label, fill=color,
+                    font=_VISUAL_PROGRESS_FONT, anchor="e",
+                )
+                ly += 18
+
+    def _render_dual_chart(self, data: dict) -> None:
+        """Two stacked charts: embedding loss (top) + silhouette score (bottom)."""
+        self._canvas_content = {"type": "dual_chart", "data": data}
+        c = self._display_canvas
+        c.delete("all")
+        cw = max(c.winfo_width(), 100)
+        ch = max(c.winfo_height(), 100)
+        c.create_rectangle(0, 0, cw, ch, fill="#1a1a1a", outline="")
+
+        half = ch // 2
+        losses = data.get("losses", [])
+        ss_vals = data.get("ss", [])
+
+        self._render_line_chart(c, losses, "Embedding Loss",
+                                "batch", "#F2B544", y_offset=0, panel_height=half)
+        if ss_vals:
+            self._render_line_chart(c, ss_vals, "Silhouette Score",
+                                    "batch", "#3B82F6", y_offset=half, panel_height=half)
+            # Target line at 0.91
+            ml, mt, mb = 64, 28, 36
+            ph_inner = half - mt - mb
+            min_ss = min(ss_vals + [0.0])
+            max_ss = max(ss_vals + [0.95])
+            rng = (max_ss - min_ss) or 1e-8
+            y_tgt = half + mt + int((1 - (0.91 - min_ss) / rng) * ph_inner)
+            if half + mt <= y_tgt <= half + mt + ph_inner:
+                c.create_line(ml, y_tgt, cw - 8, y_tgt,
+                              fill="#cc4444", dash=(4, 4), width=1)
+                c.create_text(cw - 10, y_tgt - 6, text="0.91",
+                              fill="#cc4444", font=_VISUAL_PROGRESS_FONT, anchor="e")
+
+    def _draw_training_monitor(self, data: dict) -> None:
+        self._canvas_content = {"type": "training_monitor", "data": data}
+        self._render_training_monitor(data)
+
+    def _render_empty_chart_panel(
+        self,
+        canvas: tk.Canvas,
+        title: str,
+        y_offset: int,
+        panel_height: int,
+        msg: str = "",
+        *,
+        x_offset: int = 0,
+        panel_width: int = 0,
+    ) -> None:
+        full_width = max(canvas.winfo_width(), 100)
+        cw = panel_width or full_width
+        ph = max(panel_height, 50)
+        canvas.create_rectangle(
+            x_offset, y_offset, x_offset + cw, y_offset + ph,
+            fill="#1a1a1a", outline="",
+        )
+        canvas.create_text(
+            x_offset + cw // 2, y_offset + 11, text=title,
+            fill="#cccccc", font=_VISUAL_PROGRESS_TITLE_FONT, anchor="center",
+        )
+        if msg:
+            canvas.create_text(
+                x_offset + cw // 2, y_offset + ph // 2, text=msg,
+                fill="#888888", font=_VISUAL_PROGRESS_FONT,
+                justify="center", width=max(1, cw - 24), anchor="center",
+            )
+
+    def _render_system_monitor(
+        self,
+        canvas: tk.Canvas,
+        *,
+        x_offset: int,
+        y_offset: int,
+        panel_width: int,
+        panel_height: int,
+    ) -> None:
+        width = max(1, int(panel_width))
+        height = max(1, int(panel_height))
+        meter_canvas = self._system_monitor_canvas
+        if meter_canvas is None:
+            meter_canvas = tk.Canvas(canvas, bg="#171717", highlightthickness=0, bd=0)
+            self._system_monitor_canvas = meter_canvas
+
+        meter_canvas.configure(width=width, height=height)
+        canvas.create_window(
+            x_offset, y_offset, anchor="nw", width=width, height=height,
+            window=meter_canvas,
+        )
+
+        if self._system_monitor_canvas_size != (width, height):
+            self._draw_system_monitor_meter_static(meter_canvas, width, height)
+            self._system_monitor_canvas_size = (width, height)
+        self._update_system_monitor_meter_values(meter_canvas)
+
+    def _draw_system_monitor_meter_static(
+        self,
+        canvas: tk.Canvas,
+        width: int,
+        height: int,
+    ) -> None:
+        """Draw meter arcs, ticks and labels once for the current panel size."""
+        canvas.delete("all")
+        canvas.create_rectangle(0, 0, width, height, fill="#171717", outline="")
+        # Keep the monitor title, backend label, and first meter row visually
+        # distinct.  These use the same font size as the rest of Visual Progress,
+        # so explicit vertical spacing is needed to avoid crowding.
+        title_item = canvas.create_text(
+            width // 2, 5, text="System Monitor", fill="#cccccc",
+            font=_VISUAL_PROGRESS_TITLE_FONT, anchor="n",
+            width=max(1, width - 8), justify="center",
+        )
+        backend_y = max(31, canvas.bbox(title_item)[3] + 8)
+        self._system_monitor_backend_item = canvas.create_text(
+            width // 2, backend_y, text="Waiting for metrics...", fill="#999999",
+            font=_VISUAL_PROGRESS_FONT, anchor="n", width=max(1, width - 8),
+            justify="center",
+        )
+
+        gauge_top = max(62, canvas.bbox(self._system_monitor_backend_item)[3] + 10)
+        row_height = max(1.0, (height - gauge_top) / 2.0)
+        cell_width = width / 3.0
+        canvas.create_line(0, gauge_top + row_height, width, gauge_top + row_height,
+                           fill="#282d29", width=1)
+
+        self._system_monitor_meter_items = {}
+        for index, name in enumerate(("GPU", "VRAM", "GPU Temp", "CPU", "RAM", "Swap")):
+            column = index % 3
+            row = index // 3
+            x0 = column * cell_width
+            y0 = gauge_top + row * row_height
+            if column:
+                canvas.create_line(x0, y0, x0, y0 + row_height,
+                                   fill="#282d29", width=1)
+
+            center_x = x0 + cell_width / 2.0
+            radius = max(2.0, min((cell_width - 8.0) / 2.0, row_height * 0.34))
+            center_y = y0 + row_height * 0.60
+            meter_tag = f"meter_{index}"
+
+            # Position the meter name relative to the actual arc instead of the
+            # top of the cell.  Leave roughly one character of visible space
+            # between the label and the meter arc.
+            arc_top = center_y - radius
+            label_y = max(y0 + 9.0, arc_top - 7.0)
+            name_item = canvas.create_text(
+                center_x, label_y, text=name, fill="#c7d0ca",
+                font=_VISUAL_PROGRESS_FONT, anchor="s",
+                width=max(1, int(cell_width - 4)), justify="center",
+            )
+
+            arc_points = []
+            for step in range(37):
+                theta = math.pi - step * math.pi / 36.0
+                arc_points.extend((
+                    center_x + radius * math.cos(theta),
+                    center_y - radius * math.sin(theta),
+                ))
+            canvas.create_line(
+                *arc_points, fill="#46534a", width=3, smooth=True, tags=meter_tag,
+            )
+
+            for fraction in (0.0, 0.25, 0.5, 0.75, 1.0):
+                theta = math.pi * (1.0 - fraction)
+                outer = radius - 1.0
+                inner = radius - 8.0
+                canvas.create_line(
+                    center_x + inner * math.cos(theta),
+                    center_y - inner * math.sin(theta),
+                    center_x + outer * math.cos(theta),
+                    center_y - outer * math.sin(theta),
+                    fill="#829087", width=1, tags=meter_tag,
+                )
+
+            needle = canvas.create_line(
+                center_x, center_y, center_x, center_y,
+                fill="#58a977", width=2.5, state="hidden", tags=meter_tag,
+            )
+            hub_radius = 3.0
+            hub = canvas.create_oval(
+                center_x - hub_radius, center_y - hub_radius,
+                center_x + hub_radius, center_y + hub_radius,
+                fill="#9ba99e", outline="", tags=meter_tag,
+            )
+            # Keep the numeric readout close to the meter itself rather than
+            # anchoring it to the bottom of the cell.  About two text-height
+            # units below the gauge baseline gives a clear but compact gap.
+            value_y = min(y0 + row_height - 14.0, center_y + 28.0)
+            value = canvas.create_text(
+                center_x, value_y, text="N/A", fill="#aab4ad",
+                font=_VISUAL_PROGRESS_FONT, anchor="center",
+                width=max(1, int(cell_width - 4)), justify="center",
+            )
+            self._system_monitor_meter_items[name] = {
+                "name": name_item,
+                "needle": needle,
+                "value": value,
+                "meter_tag": meter_tag,
+                "center_x": center_x,
+                "center_y": center_y,
+                "preferred_center_y": center_y,
+                "radius": radius,
+                "base_radius": radius,
+                "value_y": value_y,
+                "row_top": y0,
+                "row_bottom": y0 + row_height,
+                "needle_length": int(max(1.0, radius - 9.0)),
+                "base_needle_length": int(max(1.0, radius - 9.0)),
+            }
+
+    def _update_system_monitor_meter_values(self, canvas: tk.Canvas) -> None:
+        snapshot = dict(self._system_monitor_snapshot)
+        width = self._system_monitor_canvas_size[0]
+        backend = snapshot.get("backend") or self._training_backend_label
+        canvas.itemconfigure(
+            self._system_monitor_backend_item,
+            text=str(backend) if backend else "Waiting for metrics...",
+        )
+
+        def finite_number(value) -> bool:
+            return isinstance(value, (int, float)) and math.isfinite(float(value))
+
+        def pair_label(current: float, maximum: float, unit: str) -> str:
+            compact_value = f"{current:.1f}/{maximum:.1f}"
+            text_width = int(canvas.tk.call("font", "measure", _VISUAL_PROGRESS_FONT, compact_value))
+            if text_width > max(1, int(width / 3.0 - 4)):
+                return f"{current:.1f}/\n{maximum:.1f}\n{unit}"
+            if width / 3.0 < 112.0:
+                return f"{compact_value}\n{unit}"
+            return f"{compact_value} {unit}"
+
+        def fixed_scale(value, maximum: float, unit: str) -> tuple[str, float | None]:
+            if not finite_number(value):
+                return "N/A", None
+            numeric = float(value)
+            return pair_label(numeric, maximum, unit), min(1.0, max(0.0, numeric / maximum))
+
+        def measured_scale(used, total, unit: str) -> tuple[str, float | None]:
+            if not finite_number(used) or not finite_number(total) or float(total) <= 0:
+                return "N/A", None
+            used_value = float(used)
+            total_value = float(total)
+            return (
+                pair_label(used_value, total_value, unit),
+                min(1.0, max(0.0, used_value / total_value)),
+            )
+
+        measurements = {
+            "GPU": fixed_scale(snapshot.get("gpu_util"), 100.0, "%"),
+            "VRAM": measured_scale(
+                snapshot.get("vram_used"), snapshot.get("vram_total"), "GB",
+            ),
+            "GPU Temp": fixed_scale(snapshot.get("gpu_temp_c"), 100.0, "°C"),
+            "CPU": fixed_scale(snapshot.get("cpu"), 100.0, "%"),
+            "RAM": measured_scale(
+                snapshot.get("ram_used"), snapshot.get("ram_total"), "GB",
+            ),
+            "Swap": measured_scale(
+                snapshot.get("swap_used"), snapshot.get("swap_total"), "GB",
+            ),
+        }
+
+        for name, (label, fraction) in measurements.items():
+            items = self._system_monitor_meter_items[name]
+            canvas.itemconfigure(items["value"], text=label)
+            value_bounds = canvas.bbox(items["value"])
+            value_height = value_bounds[3] - value_bounds[1]
+            name_bounds = canvas.bbox(items["name"])
+            name_height = name_bounds[3] - name_bounds[1]
+            # Reserve the measured text height when narrow cells wrap readouts.
+            gauge_space = items["row_bottom"] - items["row_top"] - name_height - value_height - 8
+            radius = max(2.0, min(items["base_radius"], gauge_space / (1 + 3 / items["base_radius"])))
+            scale = radius / items["radius"]
+            if scale != 1.0:
+                canvas.scale(items["meter_tag"], items["center_x"], items["center_y"], scale, scale)
+                items["radius"] = radius
+            hub_radius = 3 * radius / items["base_radius"]
+            items["needle_length"] = items["base_needle_length"] * radius / items["base_radius"]
+            center_y = min(
+                max(items["preferred_center_y"], items["row_top"] + name_height + radius + 4),
+                items["row_bottom"] - value_height - hub_radius - 4,
+            )
+            canvas.move(items["meter_tag"], 0, center_y - items["center_y"])
+            items["center_y"] = center_y
+            name_y = max(items["row_top"] + name_height + 2, center_y - items["radius"] - 7)
+            canvas.coords(items["name"], items["center_x"], name_y)
+            value_y = max(
+                center_y + hub_radius + 2 + value_height / 2,
+                min(items["value_y"], items["row_bottom"] - 2 - value_height / 2),
+            )
+            canvas.coords(items["value"], items["center_x"], value_y)
+            if fraction is None:
+                canvas.itemconfigure(items["needle"], state="hidden")
+                continue
+            angle = math.pi * (1.0 - fraction)
+            center_x = items["center_x"]
+            center_y = items["center_y"]
+            needle_length = items["needle_length"]
+            canvas.coords(
+                items["needle"], center_x, center_y,
+                center_x + needle_length * math.cos(angle),
+                center_y - needle_length * math.sin(angle),
+            )
+            canvas.itemconfigure(items["needle"], state="normal")
+
+    def _render_training_monitor(self, data: dict) -> None:
+        """Training view: full-width loss above a responsive fitness/monitor split."""
+        self._canvas_content = {"type": "training_monitor", "data": data}
+        c = self._display_canvas
+        c.delete("all")
+        cw = max(c.winfo_width(), 100)
+        ch = max(c.winfo_height(), 100)
+        c.create_rectangle(0, 0, cw, ch, fill="#1a1a1a", outline="")
+
+        half = ch // 2
+        loss_series = data.get("loss_series", [])
+        fitness = data.get("fitness", [])
+
+        if loss_series:
+            self._render_multi_line_chart(
+                c,
+                loss_series,
+                "Loss",
+                data.get("loss_x_label", ""),
+                y_offset=0,
+                panel_height=half,
+                subtitle="A decreasing loss that levels off is generally a good sign.",
+                tick_decimals=3,
+                x_values=data.get("loss_x_values"),
+                history_count=data.get("loss_history_count", 0),
+                show_legend=False,
+            )
+        else:
+            self._render_empty_chart_panel(
+                c, "Loss", 0, half,
+                "A decreasing loss that levels off is generally a good sign.",
+            )
+
+        c.create_line(0, half, cw, half, fill="#2d2d2d", width=1)
+        monitor_width = max(cw - int(round(cw * 0.75)), min(180, cw // 2))
+        fitness_width = max(1, cw - monitor_width)
+
+        if fitness:
+            self._render_line_chart(
+                c,
+                fitness,
+                "mAP Fitness",
+                "epoch",
+                "#4dbbd5",
+                y_offset=half,
+                panel_height=ch - half,
+                x_offset=0,
+                panel_width=fitness_width,
+                tick_decimals=3,
+            )
+        else:
+            self._render_empty_chart_panel(
+                c,
+                "mAP Fitness",
+                half,
+                ch - half,
+                "Waiting for first epoch mAP",
+                x_offset=0,
+                panel_width=fitness_width,
+            )
+
+        c.create_line(fitness_width, half, fitness_width, ch, fill="#2d2d2d", width=1)
+        self._render_system_monitor(
+            c,
+            x_offset=fitness_width,
+            y_offset=half,
+            panel_width=monitor_width,
+            panel_height=ch - half,
+        )
+
+    # Data readers
+
+    def _read_yolo_results_csv(self, path: str) -> dict:
+        train_losses, train_epochs, map50_vals, map5095_vals, fitness_vals = [], [], [], [], []
+
+        def metric_key(text: object) -> str:
+            key = str(text).strip().lower()
+            for dash in ("\u2010", "\u2011", "\u2012", "\u2013", "\u2014", "\u2212"):
+                key = key.replace(dash, "-")
+            return re.sub(r"\s+", "", key)
+
+        def compact_key(text: object) -> str:
+            return re.sub(r"[^a-z0-9]+", "", metric_key(text))
+
+        def as_float(value: object) -> float | None:
+            try:
+                out = float(str(value).strip())
+            except (TypeError, ValueError):
+                return None
+            return out if math.isfinite(out) else None
+
+        def has_map5095(col: object) -> bool:
+            key = metric_key(col)
+            compact = compact_key(col)
+            return "map50-95" in key or "map5095" in compact
+
+        def has_map50(col: object) -> bool:
+            return "map50" in compact_key(col) and not has_map5095(col)
+
+        try:
+            with open(path, newline="", encoding="utf-8") as f:
+                reader = csv.DictReader(f)
+                fields = list(reader.fieldnames or [])
+                train_col = next(
+                    (c for c in fields if "train" in metric_key(c) and "box_loss" in metric_key(c)),
+                    None,
+                )
+                map50_col = next((c for c in fields if has_map50(c)), None)
+                map5095_col = next((c for c in fields if has_map5095(c)), None)
+
+                for row in reader:
+                    train_loss = as_float(row.get(train_col)) if train_col else None
+                    epoch = as_float(row.get("epoch"))
+                    map50 = as_float(row.get(map50_col)) if map50_col else None
+                    map5095 = as_float(row.get(map5095_col)) if map5095_col else None
+
+                    if train_loss is not None and epoch is not None and epoch >= 1 and epoch.is_integer():
+                        train_losses.append(train_loss)
+                        train_epochs.append(int(epoch))
+                    if map50 is not None:
+                        map50_vals.append(map50)
+                    if map5095 is not None:
+                        map5095_vals.append(map5095)
+                    if map50 is not None and map5095 is not None:
+                        fitness_vals.append(0.1 * map50 + 0.9 * map5095)
+        except Exception:
+            pass
+        return {
+            "train": train_losses,
+            "train_epochs": train_epochs,
+            "mAP50": map50_vals,
+            "mAP5095": map5095_vals,
+            "fitness": fitness_vals,
+        }
+
+    def _read_embedding_csv(self, path: str) -> dict:
+        losses, ss_vals = [], []
+        try:
+            with open(path, newline="", encoding="utf-8") as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    if str(row.get("event", "")).strip() == "metric":
+                        try:
+                            losses.append(float(row["loss"]))
+                        except (KeyError, ValueError):
+                            pass
+                        try:
+                            ss_vals.append(float(row["ss"]))
+                        except (KeyError, ValueError):
+                            pass
+        except Exception:
+            pass
+        return {"losses": losses, "ss": ss_vals}
+
+    # Step-specific image finder
+
+    def _step_image_dir_groups(self, step_i: int, session: str) -> list[tuple[str, list[str]]]:
+        groups: dict[int, list[tuple[str, list[str]]]] = {
+            1: [
+                ("preview", [os.path.join(session, "single_animal_images", "preview")]),
+                ("image", [os.path.join(session, "single_animal_images", "images")]),
+            ],
+            2: [
+                ("preview", [
+                    os.path.join(session, "single_animal_images", "preview"),
+                    os.path.join(session, "single_animal_images", "refine", "dataset", "preview"),
+                    os.path.join(session, "single_animal_images", "refine_add*", "dataset", "preview"),
+                ]),
+                ("image", [os.path.join(session, "single_animal_images", "images")]),
+            ],
+            3: [
+                ("preview", [os.path.join(session, "paste_blobs_clustered", "preview")]),
+                ("image", [os.path.join(session, "paste_blobs_clustered", "images")]),
+            ],
+            4: [
+                ("preview", [os.path.join(session, "paste_blobs", "preview")]),
+                ("image", [os.path.join(session, "paste_blobs", "images")]),
+            ],
+            5: [
+                ("preview", [
+                    os.path.join(session, "paste_blobs", "cropping", "preview"),
+                    os.path.join(session, "paste_blobs_clustered", "cropping", "preview"),
+                    os.path.join(session, "single_animal_images", "cropping", "preview"),
+                ]),
+                ("image", [
+                    os.path.join(session, "paste_blobs", "cropping", "images"),
+                    os.path.join(session, "paste_blobs_clustered", "cropping", "images"),
+                    os.path.join(session, "single_animal_images", "cropping", "images"),
+                ]),
+            ],
+            6: [
+                ("image", [os.path.join(session, "yolo_dataset*", "train", "images")]),
+            ],
+            8: [
+                ("preview", [os.path.join(session, OUTPUT_ROOT_DIR, "*", "tracking", "dataset*", "*", "*", *(["variable"] if self._variable_count.get() else []), "preview")]),
+            ],
+        }
+        return groups.get(step_i, [])
+
+    def _step_image_dirs(self, step_i: int, session: str) -> list[str]:
+        return [d for _, dirs in self._step_image_dir_groups(step_i, session) for d in dirs]
+
+    def _collect_image_entries(
+        self,
+        dirs: list[str],
+        cutoff: float | None,
+    ) -> list[tuple[float, str]]:
+        entries: list[tuple[float, str]] = []
+        for pattern in dirs:
+            for d in sorted(glob.glob(pattern)):
+                if os.path.isdir(d):
+                    candidates = (
+                        glob.glob(os.path.join(d, "*.png")) +
+                        glob.glob(os.path.join(d, "*.jpg")) +
+                        glob.glob(os.path.join(d, "*.jpeg"))
+                    )
+                    for path in candidates:
+                        try:
+                            mtime = os.path.getmtime(path)
+                        except OSError:
+                            continue
+                        if cutoff is not None and mtime < cutoff:
+                            continue
+                        entries.append((mtime, path))
+        return entries
+
+    def _find_step_image(self, step_i: int, session: str) -> tuple[str, int, int]:
+        start_time = None if step_i == 6 else self._step_start_times.get(step_i)
+        cutoff = (start_time - 0.5) if start_time is not None else None
+
+        # Collect from all directory groups so preview images and subsequently
+        # generated main-output images are both visible as the step progresses.
+        all_entries: list[tuple[float, str]] = []
+        preview_entries: list[tuple[float, str]] = []
+        for kind, dirs in self._step_image_dir_groups(step_i, session):
+            found = self._collect_image_entries(dirs, cutoff)
+            all_entries.extend(found)
+            if kind == "preview":
+                preview_entries.extend(found)
+
+        if not all_entries:
+            return "", 0, 0
+
+        all_entries.sort(key=lambda item: (item[0], item[1].lower()))
+        count = len(all_entries)
+
+        # Prefer the most recent OBB+triangle preview image over a plain output
+        # image. Plain images are written far more often than the capped preview
+        # sample, so picking the single most recent file overall would usually
+        # hide the annotated preview.
+        if preview_entries:
+            preview_entries.sort(key=lambda item: (item[0], item[1].lower()))
+            chosen_path = preview_entries[-1][1]
+        else:
+            chosen_path = all_entries[-1][1]
+
+        display_index = count - 1
+        return chosen_path, count, display_index + 1
+
+    # Canvas content updaters
+
+    def _show_training_loss(self, session: str) -> None:
+        """Keep live Loss continuous, with CSV means before the retained history."""
+        # The running trainer identifies its own CSV, including resumed
+        # and direction-free runs. Never borrow another experiment's CSV.
+        path = self._train_results_csv
+        data = self._read_yolo_results_csv(path) if path and os.path.isfile(path) else {}
+        fitness = data.get("fitness", [])
+
+        # The checkpoint defines which epochs are complete. During a recovery,
+        # any old CSV row for the epoch now being replayed must not be plotted.
+        active_epoch = self._train_epoch
+        epoch_size = self._train_epoch_images
+        batch_size = self._train_batch_size
+        live_count = len(self._batch_losses)
+        saved = [
+            (epoch, loss)
+            for epoch, loss in zip(data.get("train_epochs", []), data.get("train", []))
+            if active_epoch == 0 or epoch < active_epoch
+        ]
+        if live_count:
+            # Completed epochs already represented by live points must not
+            # appear again as CSV means or send the image axis backwards.
+            saved = [
+                (epoch, loss) for epoch, loss in saved
+                if epoch * epoch_size < self._batch_loss_images[0]
+            ]
+
+        saved_count = len(saved)
+        point_count = saved_count + live_count
+        if not point_count:
+            self._draw_placeholder("Training in progress...\nLoss chart will appear here.")
+            self._canvas_status.configure(text="Waiting for training results...")
+            return
+
+        # Bound rendering work across the whole run without copying every
+        # recorded batch on each refresh. Keep both sides of the CSV/live join.
+        stride = max(1, math.ceil((point_count - 1) / 1199))
+        indices = list(range(0, point_count, stride))
+        if indices[-1] != point_count - 1:
+            indices.append(point_count - 1)
+        if saved_count and live_count:
+            indices = sorted(set(indices + [saved_count - 1, saved_count]))
+        loss_values, x_values = [], []
+        history_count = 0
+        for index in indices:
+            if index < saved_count:
+                epoch, loss = saved[index]
+                x_values.append(epoch * epoch_size if epoch_size > 0 else epoch)
+                loss_values.append(loss)
+                history_count += 1
+            else:
+                live_index = index - saved_count
+                x_values.append(self._batch_loss_images[live_index])
+                loss_values.append(self._batch_losses[live_index])
+        self._draw_training_monitor(
+            {
+                "loss_series": [(loss_values, "#3B82F6", "train")],
+                "loss_x_label": "Images" if epoch_size > 0 else "epoch",
+                "loss_x_values": x_values,
+                "loss_history_count": history_count,
+                "fitness": fitness,
+            }
+        )
+        if live_count:
+            current_batch = math.ceil(
+                max(0, self._batch_loss_images[-1] - (active_epoch - 1) * epoch_size)
+                / batch_size
+            )
+            status = (
+                f"Batch {current_batch}  |  Batch size {batch_size}"
+                f"  |  Images {self._batch_loss_images[-1]}"
+                f"  |  train/box_loss = {self._batch_losses[-1]:.3f}"
+            )
+        else:
+            latest_epoch, latest_loss = saved[-1]
+            status = f"Epoch {latest_epoch}  |  train/box_loss = {latest_loss:.3f}"
+            if batch_size:
+                status += f"  |  Batch size {batch_size}"
+            if epoch_size:
+                status += f"  |  Images {latest_epoch * epoch_size}"
+        if fitness:
+            status += f"  |  fitness(0.1*mAP50+0.9*mAP50-95) = {fitness[-1]:.3f}"
+        self._canvas_status.configure(text=status)
+
+    def _show_refine_training_loss(self) -> None:
+        images = self._refine_loss_images[-1]
+        self._draw_loss_chart(
+            self._refine_losses, "Refine Blobs: Training Loss", "Images",
+            "#4dbbd5", x_values=self._refine_loss_images,
+        )
+        self._canvas_status.configure(
+            text=(
+                f"Batch {len(self._refine_losses)}  |  Batch size {self._train_batch_size}"
+                f"  |  Images {images}  |  train/box_loss = {self._refine_losses[-1]:.3f}"
+            )
+        )
+
+    def _show_embedding_loss(self, session: str) -> None:
+        paths = glob.glob(
+            os.path.join(
+                session, OUTPUT_ROOT_DIR, "*", "tracking", "dataset*", "*", "*",
+                *(["variable"] if self._variable_count.get() else []),
+                "embedding_training_metrics.csv",
+            )
+        )
+        if not paths:
+            self._draw_placeholder(
+                "ID Correction running...\n"
+                "Embedding chart appears here if embedding is enabled."
+            )
+            self._canvas_status.configure(text="No embedding metrics yet")
+            return
+        data = self._read_embedding_csv(paths[0])
+        losses = data.get("losses", [])
+        ss_vals = data.get("ss", [])
+        if losses or ss_vals:
+            self._render_dual_chart(data)
+            n = len(losses)
+            last_ss = ss_vals[-1] if ss_vals else float("nan")
+            self._canvas_status.configure(
+                text=f"Batch {n}  |  loss = {losses[-1]:.3f}  |  SS = {last_ss:.3f}"
+                if losses else "Embedding training starting..."
+            )
+        else:
+            self._draw_placeholder("Embedding training starting...")
+            self._canvas_status.configure(text="Waiting for embedding metrics...")
+
+    def _update_canvas_for_step(self, step_i: int, session: str) -> None:
+        if session and self._without_direction.get() and os.path.basename(session) != "without_direction_estimation":
+            session = os.path.join(session, "without_direction_estimation")
+        if step_i < 0 or not session:
+            self._draw_placeholder()
+            self._canvas_status.configure(text="Waiting...")
+            return
+
+        label = STEPS[step_i][0].replace("\n", " ") if step_i < len(STEPS) else ""
+
+        if step_i == 7:
+            self._show_training_loss(session)
+        elif step_i == 10 and self._overlap.get() == "super_heavy":
+            self._show_embedding_loss(session)
+        elif step_i == 2 and self._refine_losses:
+            self._show_refine_training_loss()
+            img, count, display_no = self._find_step_image(step_i, session)
+            if img:
+                if img != self._last_display_img:
+                    self._show_image_on_canvas(img, label)
+                self._canvas_status.configure(
+                    text=f"{label}  |  {os.path.basename(img)}  |  image {display_no}/{count}"
+                )
+        else:
+            img, count, display_no = self._find_step_image(step_i, session)
+            if img:
+                if img != self._last_display_img:
+                    self._show_image_on_canvas(img, label)
+                self._canvas_status.configure(
+                    text=f"{label}  |  {os.path.basename(img)}  |  image {display_no}/{count}"
+                )
+            else:
+                if self._step_image_dirs(step_i, session):
+                    # Keep the previous image visible rather than showing a placeholder
+                    last = self._last_display_img
+                    if last and os.path.isfile(last):
+                        self._show_image_on_canvas(last, os.path.basename(last))
+                        self._canvas_status.configure(text=f"Running: {label}")
+                    else:
+                        self._draw_placeholder(f"{label}\nWaiting for first output image...")
+                        self._canvas_status.configure(text=f"Running: {label}")
+                    return
+                # Fall back to last known image so canvas stays informative
+                last = self._last_display_img
+                if last and os.path.isfile(last):
+                    self._show_image_on_canvas(last, os.path.basename(last))
+                    self._canvas_status.configure(text=f"{label} running...")
+                else:
+                    self._draw_placeholder(f"{label}...")
+                    self._canvas_status.configure(text=f"Running: {label}")
+
+    # Polling
+
+    def _stop_system_monitor(self) -> None:
+        stop = getattr(self, "_system_monitor_stop", None)
+        if stop is not None:
+            stop.set()
+        self._system_monitor_thread = None
+
+    def _start_system_monitor(self) -> None:
+        self._stop_system_monitor()
+        self._system_monitor_stop = threading.Event()
+        stop = self._system_monitor_stop
+        self._system_monitor_snapshot = {}
+
+        training_cfg = self._base_cfg.get("training", {})
+        device_text = str(training_cfg.get("DEVICE", "auto"))
+        device_match = re.search(r"\d+", device_text)
+        logical_gpu_index = int(device_match.group(0)) if device_match else 0
+
+        def worker() -> None:
+            psutil.cpu_percent(interval=None)
+            while not stop.is_set():
+                if self._batch_proc is None:
+                    break
+                if self._active_step != 7:
+                    if stop.wait(0.5):
+                        break
+                    continue
+
+                vm = psutil.virtual_memory()
+                swap = psutil.swap_memory()
+                if self._training_backend_label in {"", "NVIDIA CUDA"}:
+                    gpu_util, vram_used, vram_total, gpu_temp_c = (
+                        query_nvidia_smi_index_with_temperature(logical_gpu_index)
+                    )
+                else:
+                    gpu_util, vram_used, vram_total, gpu_temp_c = None, None, None, None
+                self._system_monitor_snapshot = {
+                    "backend": self._training_backend_label or "Detecting backend...",
+                    "gpu_util": gpu_util,
+                    "vram_used": vram_used,
+                    "vram_total": vram_total,
+                    "gpu_temp_c": gpu_temp_c,
+                    "cpu": psutil.cpu_percent(interval=None),
+                    "ram_used": vm.used / (1024.0 ** 3),
+                    "ram_total": vm.total / (1024.0 ** 3),
+                    "swap_used": swap.used / (1024.0 ** 3),
+                    "swap_total": swap.total / (1024.0 ** 3),
+                }
+                if stop.wait(1.0):
+                    break
+
+        self._system_monitor_thread = threading.Thread(
+            target=worker,
+            name="FBQ Easy Tracking system monitor",
+            daemon=True,
+        )
+        self._system_monitor_thread.start()
+
+    def _canvas_poll(self) -> None:
+        """Check for new visual content while the batch runs."""
+        self._canvas_poll_id = None
+        if self._batch_proc is None or self._batch_proc.poll() is not None:
+            return
+
+        step_i = self._active_step
+        session = self._base_cfg.get("SESSION_PATH", "")
+        live_steps = {7, 10}
+        if step_i == 2 and self._refine_losses:
+            live_steps.add(2)
+        image_steps = {1, 2, 3, 4, 5, 6, 8}
+
+        # Keep live charts fresh, and keep checking image steps so the first
+        # generated image appears without waiting for the stage to finish.
+        if step_i != self._display_step or step_i in live_steps or step_i in image_steps:
+            self._display_step = step_i
+            self._update_canvas_for_step(step_i, session)
+
+        interval_ms = 1000 if step_i in live_steps or step_i in image_steps else 3000
+        self._canvas_poll_id = self.after(interval_ms, self._canvas_poll)
+
+    # Progress helpers
+
+    def _reset_training_progress(self) -> None:
+        self._training_backend_label = ""
+        self._train_epoch = 0
+        self._train_total_epochs = 0
+        self._train_epoch_images = 0
+        self._train_batch_size = 0
+        self._train_epoch_started_at = 0.0
+        self._train_processed_images = 0
+        self._train_results_csv = ""
+
+    def _set_training_epoch_metadata(
+        self, epoch: int, total_epochs: int, images: int, batch_size: int, received_at: float,
+    ) -> None:
+        """Use the running trainer's actual dataset size and batch size."""
+        self._train_epoch_started_at = received_at
+        # Ordinary epoch changes retain completed live history. A restarted
+        # epoch discards only points belonging to the attempt being replayed.
+        self._trim_training_loss((epoch - 1) * images, refine=self._active_step == 2)
+        self._train_epoch = epoch
+        self._train_total_epochs = total_epochs
+        self._train_epoch_images = images
+        self._train_batch_size = batch_size
+        self._train_processed_images = (epoch - 1) * images
+        device = f"   {self._training_backend_label}" if self._training_backend_label else ""
+        self._on_tqdm_progress(
+            0.0,
+            f"Epoch: {epoch}/{total_epochs}{device}   --fps   ETA: --h --m --s",
+        )
+
+    def _training_progress(self, desc: str, batch: int, batch_total: int, received_at: float):
+        """Display epoch progress, throughput and time left for all training epochs."""
+        match = _YOLO_TRAIN_DESC_PAT.match(desc)
+        if match is None:
+            return None
+        epoch = int(match.group(1))
+        total_epochs = max(1, int(match.group(2)))
+        image_size = int(match.group(4))
+        now = received_at
+        if epoch != self._train_epoch or not self._train_epoch_started_at:
+            self._train_epoch = epoch
+            self._train_epoch_started_at = now
+        self._train_total_epochs = total_epochs
+
+        # Trainer metadata supplies the true number of samples in the final
+        # partial batch. For older output without metadata, use batch*steps.
+        epoch_images = self._train_epoch_images or self._train_batch_size * batch_total
+        processed = min(batch * self._train_batch_size, epoch_images)
+        self._train_processed_images = (epoch - 1) * epoch_images + processed
+        elapsed = now - self._train_epoch_started_at
+        fps = processed / elapsed if elapsed > 0 and processed > 0 else None
+        fps_text = f"{fps:.0f}fps" if fps is not None else "--fps"
+        eta_text = "ETA: --h --m --s"
+        if fps is not None:
+            # Project the remaining training images at the same unrounded rate
+            # shown as fps. Validation and checkpoint saves are not timed here.
+            remaining_images = max(0, total_epochs * epoch_images - self._train_processed_images)
+            seconds = math.ceil(remaining_images / fps)
+            hours, seconds = divmod(seconds, 3600)
+            minutes, seconds = divmod(seconds, 60)
+            eta_text = f"ETA: {hours}h {minutes:02d}m {seconds:02d}s"
+        fields = [f"Epoch: {epoch}/{total_epochs}"]
+        if self._training_backend_label:
+            fields.append(self._training_backend_label)
+        fields.extend((f"{image_size}px", fps_text, eta_text))
+        return max(0.0, min(1.0, batch / max(1, batch_total))), _TRAIN_FIELD_GAP.join(fields)
+
+    def _trim_training_loss(self, images: int, *, refine: bool) -> None:
+        """Discard live samples after a restored checkpoint or epoch boundary."""
+        values = self._refine_losses if refine else self._batch_losses
+        counts = self._refine_loss_images if refine else self._batch_loss_images
+        while counts and counts[-1] > images:
+            counts.pop()
+            values.pop()
+
+    def _record_training_loss(self, value: float, images: int, *, refine: bool) -> None:
+        """One loss point per processed batch, ordered by cumulative images."""
+        if images <= 0:
+            return
+        self._trim_training_loss(images, refine=refine)
+        values = self._refine_losses if refine else self._batch_losses
+        counts = self._refine_loss_images if refine else self._batch_loss_images
+        if counts and counts[-1] == images:
+            values[-1] = value
+        else:
+            counts.append(images)
+            values.append(value)
+
+    def _redraw_progress(self) -> None:
+        c = self._progress_canvas
+        c.delete("all")
+        w = c.winfo_width()
+        if w <= 1:
+            return
+        text_item = c.create_text(
+            w // 2, 0, text=self._progress_text, fill="white",
+            font=("TkDefaultFont", 10, "bold"), anchor="n", width=max(1, w - 16),
+        )
+        text_bounds = c.bbox(text_item)
+        h = max(30, text_bounds[3] - text_bounds[1] + 8)
+        if int(c.cget("height")) != h:
+            c.configure(height=h)
+        c.coords(text_item, w // 2, h // 2)
+        c.itemconfigure(text_item, anchor="center")
+        c.create_rectangle(0, 0, w, h, fill="#151C21", outline="")
+        filled = max(0, int(w * self._progress_pct))
+        if filled:
+            c.create_rectangle(0, 0, filled, h, fill="#3B82F6", outline="")
+        c.tag_raise(text_item)
+
+    def _set_progress(self, pct: float, text: str) -> None:
+        self._progress_pct = max(0.0, min(1.0, pct))
+        self._progress_text = text
+        self._redraw_progress()
+
+    def _default_skip_flags(self) -> dict[str, bool]:
+        return {
+            "skip_initial_tracking": False,
+            "skip_trajectory_direction_filtering": False,
+            "skip_refine_blobs_through_tracking": False,
+            "skip_paste_blobs_with_crossing": False,
+            "skip_paste_blobs_clustered": False,
+            "skip_cropping": False,
+            "skip_creating_direction_dataset": False,
+            "skip_training": False,
+            "skip_detection": False,
+            "skip_id_tracking": False,
+            "skip_refinement": False,
+            "skip_creating_video": False,
+        }
+
+    def _set_skip_flags(self, flags: dict | None, *, render: bool = False) -> None:
+        merged = self._default_skip_flags()
+        for key, value in (flags or {}).items():
+            if key in merged:
+                merged[key] = bool(value)
+        self._skip_flags = merged
+        if hasattr(self, "_num_objects_sb"):
+            self._apply_individual_count_state()
+        if render and hasattr(self, "_blocks_wrap"):
+            self._vis_indices = list(range(len(STEPS)))
+            self._render_blocks(self._vis_indices)
+
+    def _skip_flags_from_config(self, cfg: dict | None, *, fallback: dict | None = None) -> dict[str, bool]:
+        flags = self._default_skip_flags()
+        for source in (fallback or {}, cfg or {}):
+            for key in flags:
+                if key in source:
+                    flags[key] = bool(source[key])
+        return flags
+
+    @staticmethod
+    def _deep_setdefault(target: dict, defaults: dict) -> None:
+        for key, value in defaults.items():
+            if key not in target:
+                target[key] = copy.deepcopy(value)
+            elif isinstance(target[key], dict) and isinstance(value, dict):
+                EasyTrackingGUI._deep_setdefault(target[key], value)
+
+    def _ensure_config_section(self, cfg: dict, key: str) -> dict:
+        section = cfg.get(key)
+        if not isinstance(section, dict):
+            section = {}
+            cfg[key] = section
+        return section
+
+    def _current_easy_answers(self) -> dict:
+        num_str = self._num_objects_sb.get().strip() if hasattr(self, "_num_objects_sb") else ""
+        try:
+            num_objects: int | str = int(num_str)
+        except (TypeError, ValueError):
+            num_objects = num_str
+        return {
+            "video": self._video_entry.get().strip() if hasattr(self, "_video_entry") else "",
+            "tracking_video": self._tracking_video_entry.get().strip()
+            if hasattr(self, "_tracking_video_entry") else "",
+            "tracking_video_is_dir": bool(self._tracking_video_is_dir.get()),
+            "session": self._get_session() if hasattr(self, "_session_entry") else "",
+            "num_objects": num_objects,
+            "variable_count": self._variable_count.get(),
+            "without_direction": self._without_direction.get(),
+            "overlap": self._overlap.get() if hasattr(self, "_overlap") else "",
+            "backward_movement": self._backward_movement.get() if hasattr(self, "_backward_movement") else "",
+            "single_animal_paste": self._use_single_animal_paste(),
+            "delete_tmp_files": bool(self._delete_tmp_files.get()) if hasattr(self, "_delete_tmp_files") else True,
+            "PASTE_COUNT": self._paste_count_sb.get() if hasattr(self, "_paste_count_sb") else "12",
+            "CLUSTER_FRAMES": self._cluster_frames_sb.get() if hasattr(self, "_cluster_frames_sb") else "12",
+            "CROP_COUNT": self._crop_count_sb.get() if hasattr(self, "_crop_count_sb") else "12",
+            "MAX_PASTE_PER_FRAME": self._max_paste_sb.get() if hasattr(self, "_max_paste_sb") else "5",
+            "NUM_IMAGES": self._num_images_sb.get() if hasattr(self, "_num_images_sb") else "5000",
+        }
+
+    def _remember_easy_answers(self) -> None:
+        self._loaded_easy_answers = self._current_easy_answers()
+
+    def _on_variable_count_changed(self):
+        variable = self._variable_count.get()
+        self._num_objects_sb.configure(state="disabled" if variable else "normal")
+        self._num_enter_button.configure(state="disabled" if variable else "normal")
+        self._num_confirmed = bool(variable)
+        if not variable:
+            self._confirmed_num_objects = self._parse_num_objects_input() or 1
+        self._apply_individual_count_state(reset_multi_paste=True)
+        self._set_post_segmentation_visibility(self._workflow_segmentation_ready)
+
+    def _parse_num_objects_input(self) -> int | None:
+        if not hasattr(self, "_num_objects_sb"):
+            return None
+        value = self._num_objects_sb.get().strip()
+        if not value.isdigit():
+            return None
+        n = int(value)
+        return n if n >= 1 else None
+
+    def _confirm_num_objects(self):
+        if self._variable_count.get():
+            self._num_confirmed = True
+            return "break"
+        n = self._parse_num_objects_input()
+        if n is None:
+            messagebox.showwarning("Invalid number", "Number of fish must be a positive integer.", parent=self)
+            return "break"
+        self._confirmed_num_objects = int(n)
+        self._num_confirmed = True
+        self._progress_details_open = True
+        self._apply_individual_count_state(reset_multi_paste=True)
+        self._set_post_segmentation_visibility(self._workflow_segmentation_ready)
+        self._update_progress_layout(True)
+        return "break"
+
+    def _invalidate_num_confirm(self):
+        self._num_confirmed = False
+        self._apply_individual_count_state()
+        self._set_post_segmentation_visibility(self._workflow_segmentation_ready)
+
+    def _on_num_objects_key_release(self, event):
+        if getattr(event, "keysym", "") in {"Return", "KP_Enter"}:
+            return
+        self._invalidate_num_confirm()
+
+    def _is_single_animal(self) -> bool:
+        return bool(not self._variable_count.get() and self._num_confirmed and self._confirmed_num_objects == 1)
+
+    def _use_single_animal_paste(self) -> bool:
+        return bool(
+            self._is_single_animal()
+            and self._single_animal_paste is not None
+            and self._single_animal_paste.get()
+        )
+
+    def _single_animal_skips_paste(self) -> bool:
+        return self._is_single_animal() and not self._use_single_animal_paste()
+
+    def _on_single_animal_paste_changed(self) -> None:
+        self._manual_skip_keys.discard("skip_paste_blobs_with_crossing")
+        self._manual_skip_keys.discard("skip_paste_blobs_clustered")
+        self._apply_individual_count_state(reset_multi_paste=True)
+
+    def _apply_individual_count_state(self, *, reset_multi_paste: bool = False) -> None:
+        is_single = self._is_single_animal()
+        if not is_single and self._single_animal_paste is not None:
+            self._single_animal_paste.set(False)
+        if hasattr(self, "_single_animal_paste_checkbox"):
+            self._single_animal_paste_checkbox.configure(
+                state="normal" if is_single else "disabled"
+            )
+
+        enable_multi_questions = bool(
+            self._num_confirmed
+            and (self._variable_count.get() or self._confirmed_num_objects >= 2 or self._use_single_animal_paste())
+        )
+        radio_state = "normal" if enable_multi_questions else "disabled"
+        for radio in getattr(self, "_overlap_radios", []):
+            radio.configure(state=radio_state)
+
+        if hasattr(self, "_num_confirm_hint"):
+            if self._variable_count.get():
+                self._num_confirm_hint.configure(text="Count inferred from detections", text_color="#3B82F6")
+            elif not self._num_confirmed:
+                self._num_confirm_hint.configure(text="Press Enter to confirm", text_color="gray")
+            elif self._single_animal_skips_paste():
+                self._num_confirm_hint.configure(text="Single fish: paste steps skipped", text_color="#3B82F6")
+            elif self._is_single_animal():
+                self._num_confirm_hint.configure(text="Single fish: paste steps enabled", text_color="#3B82F6")
+            else:
+                self._num_confirm_hint.configure(text=f"{self._confirmed_num_objects} fish confirmed", text_color="#3B82F6")
+
+        paste_keys = ("skip_paste_blobs_with_crossing", "skip_paste_blobs_clustered")
+        if self._single_animal_skips_paste():
+            for key in paste_keys:
+                self._skip_flags[key] = True
+        elif enable_multi_questions and reset_multi_paste:
+            for key in paste_keys:
+                if key not in self._manual_skip_keys:
+                    self._skip_flags[key] = False
+
+        if hasattr(self, "_blocks_wrap"):
+            self._refresh_block_colors()
+        self._update_next_action()
+
+    def _warn_individual_count_inconsistency(self, message: str) -> None:
+        print(f"[WARN] Easy Tracking individual count state: {message}", flush=True)
+
+    def _apply_backward_question_state(self) -> None:
+        """Grey out the backward question while direction estimation is off.
+
+        Direction-free runs never discard an individual for an uncertain
+        heading, and refine never deletes on a direction difference, so the
+        answer cannot change anything. Advanced Tracking still exposes the
+        skip directly for anyone who wants the pass in that mode.
+        """
+        state = "disabled" if self._without_direction.get() else "normal"
+        for radio in getattr(self, "_backward_radios", []):
+            radio.configure(state=state)
+        self._sync_refine_skip_from_backward_question()
+
+    def _sync_refine_skip_from_backward_question(self) -> None:
+        if not hasattr(self, "_backward_movement"):
+            return
+        answered_yes = self._backward_movement.get() == "yes"
+        if self._without_direction.get():
+            answered_yes = False
+        self._skip_flags["skip_refine_blobs_through_tracking"] = not answered_yes
+        if hasattr(self, "_blocks_wrap"):
+            self._refresh_block_colors()
+        self._update_next_action()
+
+    def _step_is_skipped(self, step_i: int) -> bool:
+        if step_i < 0 or step_i >= len(STEPS):
+            return False
+        _, skip_key, _ = STEPS[step_i]
+        if skip_key == "skip_cropping" and self._skip_flags.get("skip_creating_direction_dataset", False):
+            return True
+        return bool(self._skip_flags.get(skip_key, False))
+
+    def _refresh_block_colors(self) -> None:
+        for vis_i, step_i in enumerate(self._vis_indices):
+            if step_i in self._done_steps:
+                state = "done"
+            elif step_i == self._active_step:
+                state = "running"
+            else:
+                state = "disabled" if self._step_is_skipped(step_i) else "inactive"
+            if vis_i == self._selected_block and state == "inactive":
+                state = "selected"
+            self._set_block_color(vis_i, state)
+
+    def _render_blocks(self, vis_indices: list[int]) -> None:
+        self._cancel_shimmer()
+        for w in self._blocks_wrap.winfo_children():
+            w.destroy()
+        self._block_frames = []
+        self._block_text_ids = []
+        self._block_states = []
+
+        if not vis_indices:
+            tk.Label(self._blocks_wrap, text="(No process blocks)",
+                     bg="#1e1e1e", fg="#555555", font=("TkDefaultFont", 9)).pack(pady=8)
+            return
+
+        grid = tk.Frame(self._blocks_wrap, bg=_C_BG_ROW)
+        grid.pack(fill="x", padx=4, pady=6)
+        for col in range(6):
+            grid.grid_columnconfigure(col, weight=1)
+
+        for vis_i, step_i in enumerate(vis_indices):
+            lbl_text = STEPS[step_i][0]
+            blk = tk.Canvas(
+                grid, width=112, height=58, bg=_C_INACTIVE,
+                highlightthickness=1, highlightbackground="#555555",
+                bd=0, relief="flat",
+            )
+            blk.grid(row=vis_i // 6, column=vis_i % 6, padx=3, pady=3)
+            text_id = blk.create_text(
+                56, 29, text=lbl_text, fill="#93A1AC",
+                font=("TkDefaultFont", 8), justify="center", anchor="center",
+            )
+            blk.bind("<Button-1>", lambda _e, vi=vis_i: self._toggle_skip_block(vi))
+            self._block_frames.append(blk)
+            self._block_text_ids.append(text_id)
+            self._block_states.append("inactive")
+            state = "disabled" if self._step_is_skipped(step_i) else "inactive"
+            self._set_block_color(vis_i, state)
+
+    def _set_block_color(self, vis_i: int, state: str) -> None:
+        if vis_i < 0 or vis_i >= len(self._block_frames):
+            return
+        step_i = self._vis_indices[vis_i] if vis_i < len(self._vis_indices) else -1
+        if state in {"inactive", "selected"} and step_i >= 0 and self._step_is_skipped(step_i):
+            state = "disabled"
+        palette = {
+            "inactive": (_C_INACTIVE, "#93A1AC"),
+            "running":  (_C_RUNNING,  "#ffffff"),
+            "done":     (_C_DONE,     "#aaffaa"),
+            "selected": (_C_SELECTED, "#93A1AC"),
+            "disabled": (_C_DISABLED, "#555555"),
+        }
+        bg, fg = palette.get(state, (_C_INACTIVE, "#93A1AC"))
+        canvas = self._block_frames[vis_i]
+        canvas.delete("shimmer")
+        canvas.configure(bg=bg, highlightbackground="#555555")
+        canvas.itemconfigure(self._block_text_ids[vis_i], fill=fg)
+        canvas.tag_raise(self._block_text_ids[vis_i])
+        self._block_states[vis_i] = state
+
+    def _toggle_skip_block(self, vis_i: int) -> None:
+        if vis_i >= len(self._block_frames):
+            return
+        if self._batch_proc is not None and self._batch_proc.poll() is None:
+            return
+        if vis_i >= len(self._vis_indices):
+            return
+        step_i = self._vis_indices[vis_i]
+        skip_key = STEPS[step_i][1]
+        if self._single_animal_skips_paste() and skip_key in {"skip_paste_blobs_with_crossing", "skip_paste_blobs_clustered"}:
+            return
+        new_value = not bool(self._skip_flags.get(skip_key, False))
+        self._skip_flags[skip_key] = new_value
+        self._manual_skip_keys.add(skip_key)
+        self._selected_block = vis_i
+        self._refresh_block_colors()
+
+    @staticmethod
+    def _mix_color(c1: str, c2: str, ratio: float) -> str:
+        ratio = max(0.0, min(1.0, ratio))
+        a = tuple(int(c1.lstrip("#")[i:i + 2], 16) for i in (0, 2, 4))
+        b = tuple(int(c2.lstrip("#")[i:i + 2], 16) for i in (0, 2, 4))
+        mixed = tuple(int(x + (y - x) * ratio) for x, y in zip(a, b))
+        return "#{:02x}{:02x}{:02x}".format(*mixed)
+
+    def _start_shimmer(self, vis_i: int) -> None:
+        self._active_block_vis = vis_i
+        self._shimmer_phase = 0.0
+        if self._shimmer_after_id is None:
+            self._animate_shimmer()
+
+    def _cancel_shimmer(self) -> None:
+        if self._shimmer_after_id is not None:
+            try:
+                self.after_cancel(self._shimmer_after_id)
+            except Exception:
+                pass
+            self._shimmer_after_id = None
+        for canvas in self._block_frames:
+            try:
+                canvas.delete("shimmer")
+            except Exception:
+                pass
+
+    def _animate_shimmer(self) -> None:
+        self._shimmer_after_id = None
+        vis_i = self._active_block_vis
+        if (
+            vis_i < 0 or
+            vis_i >= len(self._block_frames) or
+            self._block_states[vis_i] != "running"
+        ):
+            return
+
+        canvas = self._block_frames[vis_i]
+        canvas.delete("shimmer")
+        w = max(1, canvas.winfo_width())
+        h = max(1, canvas.winfo_height())
+        stripe = 4
+        for x in range(0, w, stripe):
+            wave = (math.sin(((x / max(w, 1)) - self._shimmer_phase) * math.tau) + 1.0) / 2.0
+            color = self._mix_color(_C_RUNNING, "#6ee08c", 0.18 + wave * 0.42)
+            canvas.create_rectangle(x, 0, min(x + stripe, w), h, fill=color, outline="", tags="shimmer")
+        canvas.tag_raise(self._block_text_ids[vis_i])
+        self._shimmer_phase = (self._shimmer_phase + 0.045) % 1.0
+        self._shimmer_after_id = self.after(60, self._animate_shimmer)
+
+    def _overlap_values(self) -> tuple[float, float]:
+        return {
+            "super_heavy": (0.01, 0.5),
+            "heavy": (0.01, 0.5),
+            "light": (0.01, 0.2),
+            "none": (0.0, 0.0),
+        }.get(
+            self._overlap.get(), (0.01, 0.5)
+        )
+
+    def _video_dims(self, path: str) -> tuple[int, int]:
+        if not _HAS_CV2 or not os.path.isfile(path):
+            return 0, 0
+        try:
+            cap = cv2.VideoCapture(path)
+            w, h = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            cap.release()
+            return (w, h) if w > 0 and h > 0 else (0, 0)
+        except Exception:
+            return 0, 0
+
+    @staticmethod
+    def _img_size_from_short(short: int) -> int:
+        size = min(1024, max(32, (short // 32) * 32))
+        if sys.platform == "darwin":
+            return min(size, 640)
+        from main.compute_backend import Backend, detect_backend
+
+        return min(size, 640) if detect_backend() == Backend.AMD_ROCM else size
+
+    def _derive_dataset_geometry_flags(self, video_path: str, image_size: int) -> tuple[bool, int, bool]:
+        try:
+            image_size = max(32, int(image_size))
+        except (TypeError, ValueError):
+            image_size = 640
+
+        w, h = self._video_dims(video_path)
+        if w <= 0 or h <= 0:
+            return False, 2, True
+
+        short = min(w, h)
+        long_ = max(w, h)
+        is_square = (w == h)
+
+        if is_square and 0 <= short - image_size < 32:
+            return True, 1, True
+        if is_square and short <= image_size:
+            return True, 1, True
+
+        tiles_long = max(1, long_ // image_size)
+        tiles_short = max(1, short // image_size)
+        tile_count = max(1, min(4, tiles_long * tiles_short))
+        num_crops = max(1, math.ceil(tile_count / 2))
+        include_full = short >= 1200
+        return False, num_crops, include_full
+
+    def _check_single_animal_config_consistency(self, cfg: dict) -> None:
+        if cfg.get("VARIABLE_NUM_OBJECTS", False):
+            return
+        try:
+            num_objects = int(cfg.get("NUM_OBJECTS", 1))
+        except (TypeError, ValueError):
+            self._warn_individual_count_inconsistency("NUM_OBJECTS is not an integer in generated config.")
+            return
+
+        single_paste_enabled = bool(cfg.get("SINGLE_PASTE", False))
+        expected_radio_state = "disabled" if num_objects == 1 and not single_paste_enabled else "normal"
+        if self._num_confirmed and (
+            self._confirmed_num_objects >= 2
+            or (self._confirmed_num_objects == 1 and self._use_single_animal_paste())
+        ):
+            expected_radio_state = "normal"
+        elif not self._num_confirmed:
+            expected_radio_state = "disabled"
+        for radio in getattr(self, "_overlap_radios", []):
+            if str(radio.cget("state")) != expected_radio_state:
+                self._warn_individual_count_inconsistency(
+                    f"overlap radio state is {radio.cget('state')}, expected {expected_radio_state}."
+                )
+                break
+
+        if num_objects != 1 or single_paste_enabled:
+            return
+
+        checks = [
+            ("skip_paste_blobs_with_crossing", cfg.get("skip_paste_blobs_with_crossing") is True),
+            ("skip_paste_blobs_clustered", cfg.get("skip_paste_blobs_clustered") is True),
+            ("EMBEDDING.ENABLE", ((cfg.get("EMBEDDING", {}) or {}).get("ENABLE") is False)),
+        ]
+        for label, ok in checks:
+            if not ok:
+                self._warn_individual_count_inconsistency(f"{label} is inconsistent for NUM_OBJECTS=1.")
+        for step_name, step_key in (
+            ("Clustered Paste", "skip_paste_blobs_clustered"),
+            ("Mixed Paste", "skip_paste_blobs_with_crossing"),
+        ):
+            step_i = next((i for i, item in enumerate(STEPS) if item[1] == step_key), -1)
+            if step_i >= 0 and not self._step_is_skipped(step_i):
+                self._warn_individual_count_inconsistency(f"{step_name} block is not skipped for NUM_OBJECTS=1.")
+
+    def _build_config(self) -> dict | None:
+        video = self._video_entry.get().strip()
+        if not video:
+            messagebox.showerror("Error", "Please select a training video.")
+            return None
+        if not os.path.isfile(video):
+            messagebox.showerror("Error", "Training Video Path must be a video file.")
+            return None
+
+        tracking_video = self._tracking_video_entry.get().strip()
+        tracking_video_is_dir = bool(self._tracking_video_is_dir.get())
+        if not tracking_video:
+            messagebox.showerror("Error", "Please select an analysis video or directory.")
+            return None
+        tracking_video_files: list[str] = []
+        if tracking_video_is_dir:
+            if not os.path.isdir(tracking_video):
+                messagebox.showerror("Error", "Analysis Video Path must be a directory.")
+                return None
+            prepared_files = self._prepare_tracking_directory(tracking_video)
+            if prepared_files is None:
+                return None
+            tracking_video_files = prepared_files
+        elif not os.path.isfile(tracking_video):
+            messagebox.showerror("Error", "Analysis Video Path must be a video file.")
+            return None
+
+        session = self._get_session()
+        if not session:
+            messagebox.showerror("Error", "Session path could not be determined.")
+            return None
+
+        if not self._num_confirmed:
+            self._confirm_num_objects()
+        if not self._num_confirmed:
+            return None
+        num_objects = 2 if self._variable_count.get() else int(self._confirmed_num_objects)
+
+        cfg: dict = copy.deepcopy(self._loaded_cfg) if isinstance(self._loaded_cfg, dict) else {}
+        has_loaded_config = bool(self._loaded_config_path) or bool(self._loaded_cfg)
+        current_answers = self._current_easy_answers()
+        loaded_answers = self._loaded_easy_answers or {}
+        force_easy_values = not has_loaded_config
+
+        def answer_changed(*keys: str) -> bool:
+            return force_easy_values or any(current_answers.get(key) != loaded_answers.get(key) for key in keys)
+
+        flags = self._skip_flags_from_config({}, fallback=self._skip_flags)
+        min_overlap, max_overlap = self._overlap_values()
+        embedding_enabled = self._overlap.get() == "super_heavy"
+        match_iou = 0.5
+        interact_iou = DEFAULT_INTERACT_IOU
+        dir_min_sec = 0.5
+        dir_min_disp = 1.0
+        refine_frame_ratio = 1.0
+        run_delete_ratio = 0.4
+        single_animal_paste = self._use_single_animal_paste()
+        if self._single_animal_skips_paste():
+            flags["skip_paste_blobs_with_crossing"] = True
+            flags["skip_paste_blobs_clustered"] = True
+            embedding_enabled = False
+
+        # Auto-derive image size & crop settings from video geometry
+        vw, vh = self._video_dims(video)
+        if vw > 0 and vh > 0:
+            short = min(vw, vh)
+            img_size = self._img_size_from_short(short)
+        else:
+            img_size = 640
+
+        try:
+            geometry_img_size = img_size if answer_changed("video") else int(cfg.get("TRAIN_IMG_SIZE", img_size))
+        except (TypeError, ValueError):
+            geometry_img_size = img_size
+        skip_crop, num_crops, include_full = self._derive_dataset_geometry_flags(video, geometry_img_size)
+        localized = False
+
+        # Derived paths: always <session>/segmentation/, matching where
+        # segmentation itself writes (see gui_segmentation.py's _default_output_dir).
+        pickle_path, background_path = segmentation_paths_for_session(session, video)
+        seg_meta = read_segmentation_metadata(pickle_path)
+        meta_training_start = int(seg_meta["training_frame_start"]) if seg_meta else 0
+        meta_training_end = int(seg_meta["training_frame_end"]) if seg_meta else -1
+        meta_frame_interval = int(seg_meta["training_frame_interval"]) if seg_meta else 5
+
+        # Cluster frames count
+        try:
+            total_images = int(cfg.get("NUM_IMAGES", 10000))
+        except (TypeError, ValueError):
+            total_images = 10000
+        effective_skip_crop = skip_crop if answer_changed("video") else bool(flags.get("skip_cropping", skip_crop))
+        effective_include_full = include_full
+        if not answer_changed("video") and "USE_FULL" in cfg:
+            effective_include_full = bool(cfg.get("USE_FULL"))
+        images_per_frame = (0 if effective_skip_crop else num_crops) + (1 if effective_include_full else 0)
+        cluster_frames = max(1, math.ceil(total_images * 0.05 / max(1, images_per_frame)))
+
+        default_cfg = {
+            "SESSION_PATH":               session,
+            "TRAINING_VIDEO_PATH":        video,
+            "TRACKING_VIDEO_PATH":        tracking_video,
+            "PRE_RESULT_PATH":            seg_meta.get("pre_result_path", "") if not has_loaded_config else "",
+            "TRACKING_VIDEO_FILES":       tracking_video_files,
+            "NUM_OBJECTS":                num_objects,
+            "TRAIN_IMG_SIZE":             geometry_img_size,
+            "TRACKING_VIDEO_PATH_IS_DIR": tracking_video_is_dir,
+            "AUTO_PARAMS":                True,
+            "LOCALIZED_RATIO":            0.9,
+            "MIN_OVERLAP":                min_overlap,
+            "MAX_OVERLAP":                max_overlap,
+            "DIR_MIN_SEC":                dir_min_sec,
+            "WIDTH_SCALE_MIN":            _WIDTH_SCALE_MIN,
+            "WIDTH_SCALE_MAX":            _WIDTH_SCALE_MAX,
+            "NUM_CROPS":                  num_crops,
+            "LOCALIZED":                  localized,
+            "USE_FULL":                   effective_include_full,
+            "USE_CROP":                   not skip_crop,
+            "CLUSTER_FRAMES":             cluster_frames,
+            "SINGLE_PASTE":    single_animal_paste,
+        }
+
+        # Loaded configs keep their existing values; these defaults only fill keys
+        # that are absent, or provide the complete config for a new Easy run.
+        default_cfg.update({
+            "NUM_WORKERS":             "auto",
+            "NUM_PREVIEW_FRAMES":      20,
+            "PREVIEW_INTERVAL":        100,
+            "FRAME_INTERVAL":          meta_frame_interval,
+            "NUM_IMAGES":              10000,
+            "RANDOM_SEED":             0,
+            "delete_tmp_files":        bool(self._delete_tmp_files.get()) if hasattr(self, "_delete_tmp_files") else True,
+
+            # Initial tracking
+            "INIT_MAX_GAP":            1,
+            "SKIP_INIT_PREVIEW":       False,
+
+            # Direction filtering
+            "TRAJ_MAX_DIST":           2.0,
+            "TRAJ_MAX_JUMP":           2.0,
+            "MIN_ASPECT":              1.1,
+            "DIR_MIN_DISP":            dir_min_disp,
+            "SKIP_DIR_PREVIEW":        False,
+
+            # Refine blobs
+            "REFINE_FRAME_RATIO":      refine_frame_ratio,
+            "REFINE_EPOCHS":           5,
+            "REFINE_BATCH":            "auto",
+            "REFINE_ITERS":            1,
+            "REFINE_MODEL":            "yolo11n-obb",
+            "REFINE_CONF":             0.2,
+            "RUN_DELETE_RATIO":        run_delete_ratio,
+            "SKIP_REFINE_PREVIEW":     False,
+
+            # Paste composition
+            "RATIO_SINGLE":            0.1,
+            "RATIO_P2":                0.5,
+            "RATIO_P3":                0.4,
+            "FREE_SCALE":              0.25,
+            "FREE_RATIO_SINGLE":       0.0,
+            "FREE_RATIO_P2":           1.0,
+            "FREE_RATIO_P3":           1.0,
+
+            # Paste placement / appearance
+            "MAX_TRIES":               100,
+            "PASTE_SCALE_MIN":         0.9,
+            "PASTE_SCALE_MAX":         1.1,
+            "PASTE_MIN_ASPECT":        1.1,
+            "PASTE_LAYER_MODE":        "mixed",
+            "UNDER_PASTE_PROB":        0.5,
+            "OCCLUDER_MARGIN":         -2,
+            "ALPHA_MODE":              "distance",
+            "FEATHER_MIN":             2,
+            "FEATHER_MAX":             4,
+            "EDGE_BLUR_KSIZE":         7,
+            "EDGE_BLUR_SIGMA":         11.0,
+            "BRIGHT_MIN":              0.90,
+            "BRIGHT_MAX":              1.10,
+            "CONTRAST_MIN":            0.90,
+            "CONTRAST_MAX":            1.10,
+
+            # Clustered paste
+            "CLUSTERED_RATIO":         0.05,
+            "CLUSTER_COUNT":           12,
+            "CLUSTER_FIT_LONG":        0.8,
+            "CLUSTER_FIT_SHORT":       0.8,
+            "CLUSTER_BREAK_PROB":      0.20,
+
+            # Dataset
+            "VAL_RATIO":               0.05,
+        })
+
+        default_cfg["training"] = {
+            "EPOCHS":            50,
+            "LR0":               DEFAULT_LR0,
+            "LRF":               DEFAULT_LRF,
+            "SAVE_PERIOD":       5,
+            "BATCH_SIZE":        "auto",
+            "PRETRAINED_MODEL":  "yolo11n-obb",
+            "DEVICE":            "auto",
+            "FIRST_FRAME":       meta_training_start,
+            "LAST_FRAME":        meta_training_end,
+        }
+        try:
+            variable_interior_max_age = max(30, int((cfg.get("analysis", {}) or {}).get("MAX_AGE", 10)))
+        except (TypeError, ValueError):
+            variable_interior_max_age = 30
+        default_cfg["analysis"] = {
+            "DEVICE":                    "auto",
+            "BATCH_SIZE":                "auto",
+            "WEIGHT":                    "last",
+            "CONF":                      0.1,
+            "NMS_IOU":                   0.8,
+            "SKIP_DETECT_PREVIEW":       False,
+            "MATCH_IOU":                 match_iou,
+            "MATCH_ANGLE":               90.0,
+            "MAX_AXIS_ERR":              45.0,
+            "MAX_AGE":                   10,
+            "VARIABLE_POPULATION_MODE":  "edge",
+            "VARIABLE_EDGE_CONFIRM_FRAMES": 2,
+            "VARIABLE_INTERIOR_CONFIRM_FRAMES": 10,
+            "VARIABLE_INTERIOR_MAX_AGE": variable_interior_max_age,
+            "FLIP_SEC":                  5.0,
+            "TRACKING_COST": {
+                "IOU_WEIGHT":            1.0,
+                "DIRECTION_WEIGHT":      1.0,
+                "MISS_WEIGHT":           1.0,
+                "DISTANCE_WEIGHT":       1.0,
+            },
+            "FIRST_FRAME":       0,
+            "LAST_FRAME":        -1,
+        }
+        default_cfg["EMBEDDING"] = {
+            "ENABLE":                    embedding_enabled,
+            "DEVICE":                    "auto",
+            "IMG_SIZE":                  "auto",
+            "PREVIEW_COUNT":             100,
+            "INTERACT_IOU":              interact_iou,
+        }
+        default_cfg["create_video"] = {
+            "WEIGHT":               "last",
+            "FRAME_STEP":           1,
+            "FPS":                  None,
+            "ACCELERATION":         "auto",
+            "EXPORT_RAW":           False,
+            "EXPORT_IMAGES":        False,
+            "IMAGE_FORMAT":         "jpeg",
+            "DRAW_OBB":             True,
+            "DRAW_MODE":            "obb",
+            "DRAW_LABELS":          False,
+            "DRAW_ARROW":           True,
+            "DRAW_KEYPOINTS":       True,
+            "OBB_WIDTH":            1,
+            "ARROW_WIDTH":          0,
+            "ARROW_ALPHA":          0.3,
+            "ARROW_SCALE":          1.2,
+            "LABEL_SCALE":          0.5,
+            "LABEL_THICKNESS":      1,
+        }
+        default_cfg["BEHAVIOR"] = {
+            "ENABLE":             True,
+            "MIN_SPEED_PX_S":     1.0,
+            "TURN_THRESHOLD_DEG": 30.0,
+        }
+        default_cfg["TRACK_REPRESENTATION"] = "obb"
+
+        self._deep_setdefault(cfg, default_cfg)
+        cfg["AUTO_PARAMS"] = True
+        cfg["EMBEDDING"]["INTERACT_IOU"] = interact_iou
+        cfg["DIR_MIN_DISP"] = 1.0
+        cfg["REFINE_FRAME_RATIO"] = 1.0
+        cfg["RUN_DELETE_RATIO"] = 0.4
+        cfg["NUM_PREVIEW_FRAMES"] = 20
+        # Always refresh, regardless of whether the video/session answers
+        # changed: these are pure derived lookups, never user-customized, and
+        # a stale value (e.g. relativized against a since-changed SESSION_PATH)
+        # must not survive a save/build.
+        cfg["PICKLE_PATH"] = pickle_path
+        cfg["BACKGROUND_PATH"] = background_path
+
+        # The ROIs of the analysis: they say which part of the frame holds
+        # the fish and how many animals each part holds. They are always
+        # written from the editor, so a stale roster never survives a save.
+        try:
+            analysis_rois = self._collect_analysis_rois()
+        except ValueError as exc:
+            messagebox.showerror("Error", str(exc))
+            return None
+        if analysis_rois:
+            cfg["ROI_SETS"] = analysis_rois
+            if self._analysis_roi_per_arena.get():
+                # Every ROI becomes an arena of its own: the pipeline runs once
+                # per arena, and the fish of an arena are numbered on their own.
+                cfg["TANKS"] = self._arena_roster_entries(analysis_rois)
+            else:
+                cfg.pop("TANKS", None)
+        else:
+            cfg.pop("ROI_SETS", None)
+            cfg.pop("TANKS", None)
+
+        training_videos = [video] + [
+            path for path in self._extra_training_videos if path and path != video
+        ]
+        if len(training_videos) > 1:
+            cfg["TRAINING_VIDEO_PATHS"] = training_videos
+        else:
+            cfg.pop("TRAINING_VIDEO_PATHS", None)
+        if answer_changed("video"):
+            cfg.update({
+                "TRAINING_VIDEO_PATH":        video,
+                "TRAIN_IMG_SIZE":             img_size,
+                "NUM_CROPS":                  num_crops,
+                "LOCALIZED":                  False,
+                "FREE_SCALE":                 0.25,
+                "USE_FULL":                   include_full,
+                "USE_CROP":                   not skip_crop,
+                "CLUSTER_FRAMES":             cluster_frames,
+            })
+            cfg["FRAME_INTERVAL"] = meta_frame_interval
+            training_cfg = self._ensure_config_section(cfg, "training")
+            training_cfg["FIRST_FRAME"] = meta_training_start
+            training_cfg["LAST_FRAME"] = meta_training_end
+            flags["skip_cropping"] = skip_crop
+        cfg["TRACKING_VIDEO_PATH"] = tracking_video
+        cfg["TRACKING_VIDEO_PATH_IS_DIR"] = tracking_video_is_dir
+        cfg["TRACKING_VIDEO_FILES"] = tracking_video_files
+        if answer_changed("session"):
+            cfg["SESSION_PATH"] = session
+        cfg.pop("INIT_CSV_PATH", None)
+        if answer_changed("num_objects", "variable_count"):
+            cfg["NUM_OBJECTS"] = num_objects
+        if answer_changed("overlap"):
+            cfg["MIN_OVERLAP"] = min_overlap
+            cfg["MAX_OVERLAP"] = max_overlap
+            self._ensure_config_section(cfg, "EMBEDDING")["ENABLE"] = embedding_enabled
+        if self._overlap.get() == "none":
+            self._ensure_config_section(cfg, "EMBEDDING")["ENABLE"] = False
+        if answer_changed("single_animal_paste"):
+            cfg["SINGLE_PASTE"] = single_animal_paste
+        if answer_changed("delete_tmp_files"):
+            cfg["delete_tmp_files"] = bool(self._delete_tmp_files.get())
+
+        # Paste / cluster controls - always apply spinbox values
+        cfg["PASTE_COUNT"] = int(self._paste_count_sb.get())
+        cfg["CLUSTER_FRAMES"] = int(self._cluster_frames_sb.get())
+        cfg["CROP_COUNT"] = int(self._crop_count_sb.get())
+        cfg["MAX_PASTE_PER_FRAME"] = int(self._max_paste_sb.get())
+        cfg["NUM_IMAGES"] = int(self._num_images_sb.get())
+
+        if num_objects == 1 and not single_animal_paste:
+            flags["skip_paste_blobs_with_crossing"] = True
+            flags["skip_paste_blobs_clustered"] = True
+            self._ensure_config_section(cfg, "EMBEDDING")["ENABLE"] = False
+
+        cfg["VARIABLE_NUM_OBJECTS"] = self._variable_count.get()
+        cfg["WITHOUT_DIRECTION_ESTIMATION"] = self._without_direction.get()
+        cfg.update(flags)
+        self._check_single_animal_config_consistency(cfg)
+        return cfg
+
+    def _write_config(self, cfg: dict, path: str | None = None) -> str | None:
+        session = cfg["SESSION_PATH"]
+        try:
+            if path is None:
+                path = self._loaded_config_path or os.path.join(session, "config.yaml")
+            target_dir = os.path.dirname(path) or session
+            if target_dir:
+                os.makedirs(target_dir, exist_ok=True)
+            temp_path = f"{path}.tmp.{os.getpid()}.{int(time.time() * 1000)}"
+            with open(temp_path, "w", encoding="utf-8") as f:
+                yaml.dump(relativize_config_paths(cfg), f, sort_keys=False, allow_unicode=True)
+            os.replace(temp_path, path)
+            self._loaded_cfg = copy.deepcopy(cfg)
+            self._loaded_config_path = path
+            self._remember_easy_answers()
+            return path
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to save config:\n{e}")
+            return None
+
+    def _save_config(self) -> None:
+        cfg = self._build_config()
+        if cfg is None:
+            return
+        path = self._write_config(cfg)
+        if path is not None:
+            saved_flags = {key: cfg.get(key, self._skip_flags.get(key, False)) for key in self._default_skip_flags()}
+            batch_running = self._batch_proc is not None and self._batch_proc.poll() is None
+            self._set_skip_flags(saved_flags, render=not batch_running)
+            messagebox.showinfo("Saved", f"Config saved to:\n{path}")
+
+    # Batch execution
+    def _run_easy_tracking(self) -> None:
+        cfg = self._build_config()
+        if cfg is None:
+            return
+        self._start_batch(cfg)
+
+    def _videos_without_segmentation(self, cfg: dict) -> list[str]:
+        """The training videos that have no segmentation of their own yet."""
+        session = str(cfg.get("SESSION_PATH", "") or "").strip()
+        if not session:
+            return []
+        videos = cfg.get("TRAINING_VIDEO_PATHS") or []
+        if isinstance(videos, str):
+            videos = [videos]
+        main_video = str(cfg.get("TRAINING_VIDEO_PATH", "") or "").strip()
+        missing: list[str] = []
+        for video in videos:
+            path = str(video or "").strip()
+            if not path or path == main_video:
+                continue
+            stem = os.path.splitext(os.path.basename(path))[0]
+            pickle_path, _background_path = segmentation_paths_for_session(
+                os.path.join(session, "training_videos", stem), path,
+            )
+            if not os.path.isfile(pickle_path):
+                missing.append(os.path.basename(path))
+        return missing
+
+    def _start_batch(self, cfg: dict, cfg_path: str | None = None) -> None:
+        if cfg_path is None:
+            cfg_path = self._write_config(cfg)
+        if cfg_path is None:
+            return
+
+        missing = self._videos_without_segmentation(cfg)
+        if missing:
+            # Auto-filter to only segmented videos so the run can proceed
+            # instead of aborting on a missing segmentation.
+            segmented = []
+            main_video = str(cfg.get("TRAINING_VIDEO_PATH", "") or "").strip()
+            if main_video:
+                segmented.append(main_video)
+            for video in (cfg.get("TRAINING_VIDEO_PATHS") or []):
+                path = str(video or "").strip()
+                if not path or path == main_video:
+                    continue
+                if os.path.basename(path) in missing:
+                    continue
+                segmented.append(path)
+            cfg["TRAINING_VIDEO_PATHS"] = segmented
+            messagebox.showwarning(
+                "Training videos",
+                "These videos have no segmentation yet and were skipped:\n"
+                + "\n".join(missing)
+                + "\n\nSegment them later with the same settings "
+                "(Launch Segmentation, then Segment other videos with these settings).",
+            )
+
+        self._active_config_path = cfg_path
+        loaded_flags = {key: cfg.get(key, self._skip_flags.get(key, False)) for key in self._default_skip_flags()}
+        self._set_skip_flags(loaded_flags, render=False)
+        self._base_cfg = copy.deepcopy(cfg)
+        self._vis_indices = list(range(len(STEPS)))
+        self._done_steps = set()
+        self._active_step = -1
+        self._active_block_vis = -1
+        self._selected_block = -1
+
+        self._render_blocks(self._vis_indices)
+        self._set_progress(0.0, "Starting...")
+        self._batch_log_path = ""
+        self._stop_requested = False
+
+        self._last_run_state = "running"
+        self._progress_details_open = True
+        self._set_post_segmentation_visibility(self._workflow_segmentation_ready)
+        self._update_next_action()
+
+        self._run_btn.configure(state="disabled")
+        self._switch_btn.configure(state="disabled")
+        self._direction_mode_checkbox.configure(state="disabled")
+        self._save_btn.configure(state="normal")
+        self._load_btn.configure(state="disabled")
+        self._stop_btn.configure(state="normal")
+
+        flags = subprocess.CREATE_NEW_PROCESS_GROUP if sys.platform == "win32" else 0
+        kw = {"creationflags": flags} if sys.platform == "win32" else {"start_new_session": True}
+        env = with_pythonpath(os.environ.copy(), PROJECT_ROOT, MAIN_PATH)
+        # Keep raw tqdm redraws available to this GUI for its live loss chart,
+        # while batch.py still writes a compact persistent log.
+        env["FBQ_GUI_PROGRESS_PROTOCOL"] = "1"
+        self._batch_proc = subprocess.Popen(
+            [sys.executable, "-u", BATCH_SCRIPT, cfg_path],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            env=env,
+            **kw,
+        )
+        self._start_system_monitor()
+        threading.Thread(target=self._monitor_batch, daemon=True).start()
+
+    def _echo_tqdm_line(self, line: str, previous_len: int) -> int:
+        import shutil
+        text = line.rstrip()
+        cols = shutil.get_terminal_size((120, 24)).columns
+        if len(text) > cols:
+            text = text[:cols]
+        pad = " " * max(0, min(int(previous_len), cols) - len(text))
+        _safe_stdout_write("\r" + text + pad)
+        sys.stdout.flush()
+        return len(text)
+
+    def _apply_batch_progress_record(self, line: str, received_at: float) -> None:
+        """Apply ordered reader events on Tk's thread using their receipt times."""
+        backend_match = re.match(r"\[INFO\] training device: .* \(([^)]+)\)$", line)
+        if backend_match:
+            self._training_backend_label = backend_match.group(1)
+            return
+
+        run_prefix = "[FBQ TRAIN RUN] "
+        if line.startswith(run_prefix):
+            if self._active_step in (2, 7):
+                run = json.loads(line[len(run_prefix):])
+                completed_epochs = int(run["completed_epochs"])
+                retained_images = (
+                    completed_epochs * self._train_epoch_images
+                    if run["results_csv"] == self._train_results_csv else 0
+                )
+                self._trim_training_loss(retained_images, refine=self._active_step == 2)
+                self._train_results_csv = run["results_csv"]
+                self._train_epoch = completed_epochs + 1
+            return
+
+        epoch_meta = _TRAIN_EPOCH_META_PAT.fullmatch(line)
+        if epoch_meta:
+            if self._active_step in (2, 7):
+                epoch, total, images, batch_size = map(int, epoch_meta.groups())
+                self._set_training_epoch_metadata(epoch, total, images, batch_size, received_at)
+            return
+
+        match = _TQDM_PAT.search(line)
+        if match is None:
+            return
+        n, tot = int(match.group(1)), int(match.group(2))
+        desc_m = re.search(r"\s(\d+)%\|", line)
+        if desc_m:
+            prefix = line[:desc_m.start()]
+            colon = prefix.rfind(":")
+            desc = prefix[:colon].strip() if colon >= 0 else prefix.strip()
+        else:
+            desc = ""
+        training = (
+            self._training_progress(desc, n, tot, received_at)
+            if self._active_step in (2, 7) else None
+        )
+        if training is not None:
+            pct, text = training
+            self._on_tqdm_progress(pct, text)
+            loss_m = _YOLO_LOSS_PAT.search(line)
+            if loss_m and n > 0:
+                self._record_training_loss(
+                    float(loss_m.group(1)), self._train_processed_images,
+                    refine=self._active_step == 2,
+                )
+        elif not (self._active_step in (2, 7) and self._train_epoch > 0):
+            text = f"{desc}  {n}/{tot}" if desc else f"{n}/{tot}"
+            self._on_tqdm_progress(n / max(tot, 1), text)
+
+
+
+    def _handle_batch_output_record(self, line: str, state: dict) -> None:
+        line = _ANSI_ESCAPE_RE.sub("", line.rstrip("\r\n"))
+        if (line.startswith("[INFO] training device:")
+                or line.startswith("[FBQ TRAIN RUN] ")
+                or _TRAIN_EPOCH_META_PAT.fullmatch(line)):
+            self._post_ui_event(self._apply_batch_progress_record, line, time.monotonic())
+
+        if line == "":
+            if not state.get("last_was_tqdm", False):
+                _safe_stdout_write("\n")
+                sys.stdout.flush()
+            return
+
+        match = _TQDM_PAT.search(line)
+        if match:
+            state["last_tqdm_len"] = self._echo_tqdm_line(line, int(state.get("last_tqdm_len", 0)))
+            state["last_was_tqdm"] = True
+            # Stage changes, epoch resets and loss samples share one FIFO queue.
+            # The reader never mutates the training state used by Tk rendering.
+            self._post_ui_event(self._apply_batch_progress_record, line, time.monotonic())
+            return
+
+        if state.get("last_was_tqdm", False):
+            if _stdout_supports_overwrite():
+                _safe_stdout_write("\n")
+                sys.stdout.flush()
+            state["last_was_tqdm"] = False
+            state["last_tqdm_len"] = 0
+
+        _safe_stdout_write(line + "\n")
+        sys.stdout.flush()
+
+        if line.startswith("Saving CLI log to:"):
+            self._batch_log_path = line.split(":", 1)[1].strip()
+        elif "] START: " in line:
+            script = line.split("] START: ", 1)[-1].strip()
+            step_i = SCRIPT_TO_IDX.get(script, -1)
+            if step_i >= 0 and step_i in self._vis_indices:
+                vi = self._vis_indices.index(step_i)
+                self._post_ui_event(self._on_step_start, vi, script)
+        elif "] END:   " in line:
+            script = line.split("] END:   ", 1)[-1].split("  (")[0].strip()
+            step_i = SCRIPT_TO_IDX.get(script, -1)
+            if step_i >= 0 and step_i in self._vis_indices:
+                vi = self._vis_indices.index(step_i)
+                state["done_count"] = int(state.get("done_count", 0)) + 1
+                self._post_ui_event(self._on_step_done, vi, step_i, script)
+
+    def _monitor_batch(self) -> None:
+        proc = self._batch_proc
+        if proc is None or proc.stdout is None:
+            return
+
+        state = {"done_count": 0, "last_was_tqdm": False, "last_tqdm_len": 0}
+        decoder = codecs.getincrementaldecoder("utf-8")("replace")
+        buf: list[str] = []
+        last_delim_was_cr = False
+        stdout = proc.stdout
+        read_chunk = getattr(stdout, "read1", stdout.read)
+
+        def flush_record() -> None:
+            nonlocal buf
+            line = "".join(buf)
+            buf = []
+            try:
+                self._handle_batch_output_record(line, state)
+            except Exception:
+                # A malformed progress/status line must never terminate the
+                # monitor thread. Keep draining stdout so the batch process
+                # cannot block on a full pipe, and still deliver its exit code.
+                traceback.print_exc()
+
+        try:
+            while True:
+                try:
+                    chunk = read_chunk(4096)
+                except (OSError, ValueError):
+                    break
+                if not chunk:
+                    break
+                text = decoder.decode(chunk)
+                for ch in text:
+                    if ch == "\r" or ch == "\n":
+                        if ch == "\n" and last_delim_was_cr and not buf:
+                            last_delim_was_cr = False
+                            continue
+                        flush_record()
+                        last_delim_was_cr = (ch == "\r")
+                    else:
+                        buf.append(ch)
+                        last_delim_was_cr = False
+
+            tail = decoder.decode(b"", final=True)
+            if tail:
+                for ch in tail:
+                    if ch == "\r" or ch == "\n":
+                        if ch == "\n" and last_delim_was_cr and not buf:
+                            last_delim_was_cr = False
+                            continue
+                        flush_record()
+                        last_delim_was_cr = (ch == "\r")
+                    else:
+                        buf.append(ch)
+                        last_delim_was_cr = False
+            if buf:
+                flush_record()
+
+            if state.get("last_was_tqdm", False) and _stdout_supports_overwrite():
+                _safe_stdout_write("\n")
+        finally:
+            proc.wait()
+            self._post_ui_event(self._on_batch_finished, proc.returncode, proc)
+
+    def _on_tqdm_progress(self, pct: float, text: str) -> None:
+        self._set_progress(pct, text)
+
+    def _on_step_start(self, vis_i: int, script: str) -> None:
+        self._active_step = self._vis_indices[vis_i] if vis_i < len(self._vis_indices) else -1
+        if self._active_step >= 0:
+            self._step_start_times[self._active_step] = time.time()
+        self._reset_training_progress()
+        if script == "obb_detector_training":
+            self._batch_losses = []
+            self._batch_loss_images = []
+        elif script == "direction_class_filtering":
+            self._refine_losses = []
+            self._refine_loss_images = []
+        self._display_step = -2
+        self._set_block_color(vis_i, "running")
+        self._start_shimmer(vis_i)
+        self._set_progress(0.0, script + "...")
+        # Kick off canvas polling if not already running
+        if self._canvas_poll_id is None:
+            self._canvas_poll()
+
+    def _persist_completed_step_skips(self, step_i: int) -> None:
+        """Persist completed Easy Tracking progress into the active config.
+
+        Every successfully completed stage and every earlier stage is marked
+        skip=true so a stopped run can resume from the next unfinished stage.
+        The file is re-read first because processing stages may have persisted
+        other automatic parameters while the batch was running.
+        """
+        if step_i < 0:
+            return
+        path = self._active_config_path or self._loaded_config_path
+        if not path:
+            return
+
+        last_i = min(int(step_i), len(STEPS) - 1)
+        completed_keys = [STEPS[i][1] for i in range(last_i + 1)]
+        temp_path = ""
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                cfg = yaml.safe_load(f) or {}
+            if not isinstance(cfg, dict):
+                raise ValueError("config root must be a mapping")
+
+            changed = False
+            for key in completed_keys:
+                if cfg.get(key) is not True:
+                    cfg[key] = True
+                    changed = True
+
+            if changed:
+                temp_path = f"{path}.tmp.{os.getpid()}.{int(time.time() * 1000)}"
+                with open(temp_path, "w", encoding="utf-8") as f:
+                    yaml.dump(cfg, f, sort_keys=False, allow_unicode=True)
+                os.replace(temp_path, path)
+                temp_path = ""
+
+            for key in completed_keys:
+                self._skip_flags[key] = True
+                self._base_cfg[key] = True
+                self._loaded_cfg[key] = True
+
+            if changed:
+                print(
+                    f"[INFO] Easy Tracking resume progress saved through {STEPS[last_i][2]}: "
+                    f"{', '.join(completed_keys)}",
+                    flush=True,
+                )
+        except Exception as exc:
+            print(
+                f"[WARN] Could not persist Easy Tracking resume progress to {path}: {exc}",
+                flush=True,
+            )
+        finally:
+            if temp_path:
+                try:
+                    os.remove(temp_path)
+                except FileNotFoundError:
+                    pass
+
+    def _on_step_done(self, vis_i: int, step_i: int, script: str) -> None:
+        self._persist_completed_step_skips(step_i)
+        self._done_steps.add(step_i)
+        self._refresh_block_colors()
+        if self._active_block_vis == vis_i:
+            self._active_block_vis = -1
+            self._cancel_shimmer()
+        self._set_block_color(vis_i, "done")
+        self._set_progress(1.0, script + " done")
+        # Refresh canvas to show the just-completed step's output
+        session = self._base_cfg.get("SESSION_PATH", "")
+        self._display_step = -2         # force re-render on next poll
+        self._update_canvas_for_step(step_i, session)
+
+    def _sync_skip_panels_from_config(self, path: str | None = None) -> None:
+        """Reload persisted skip flags and reflect them in the Easy Tracking panels."""
+        config_path = path or self._active_config_path or self._loaded_config_path
+        if not config_path or not os.path.isfile(config_path):
+            flags = {
+                key: self._base_cfg.get(key, self._skip_flags.get(key, False))
+                for key in self._default_skip_flags()
+            }
+            self._set_skip_flags(flags, render=True)
+            return
+
+        try:
+            with open(config_path, "r", encoding="utf-8") as f:
+                cfg = yaml.safe_load(f) or {}
+            if not isinstance(cfg, dict):
+                raise ValueError("config root must be a mapping")
+            self._loaded_cfg = copy.deepcopy(cfg)
+            self._base_cfg.update({
+                key: bool(cfg.get(key, False))
+                for key in self._default_skip_flags()
+                if key in cfg
+            })
+            self._set_skip_flags(self._skip_flags_from_config(cfg), render=True)
+        except Exception as exc:
+            print(
+                f"[WARN] Could not synchronize Easy Tracking step panels from {config_path}: {exc}",
+                flush=True,
+            )
+            flags = {
+                key: self._base_cfg.get(key, self._skip_flags.get(key, False))
+                for key in self._default_skip_flags()
+            }
+            self._set_skip_flags(flags, render=True)
+
+    def _on_batch_finished(
+        self,
+        returncode: int,
+        proc: subprocess.Popen | None = None,
+    ) -> None:
+        if proc is not None and self._batch_proc is not proc:
+            return
+        stopped_by_user = self._stop_requested
+        self._stop_requested = False
+        # Cancel canvas polling
+        if self._canvas_poll_id is not None:
+            try:
+                self.after_cancel(self._canvas_poll_id)
+            except Exception:
+                pass
+            self._canvas_poll_id = None
+
+        self._stop_system_monitor()
+        self._batch_proc = None
+        self._active_step = -1
+        self._active_block_vis = -1
+        self._cancel_shimmer()
+
+        # Reset visual progress, then reload the persisted skip state so the
+        # panels exactly match config.yaml before the user edits or resumes.
+        self._done_steps = set()
+        self._selected_block = -1
+        active_config_path = self._active_config_path
+        self._sync_skip_panels_from_config(active_config_path)
+        self._active_config_path = ""
+
+        self._run_btn.configure(state="normal")
+        self._switch_btn.configure(state="normal")
+        self._direction_mode_checkbox.configure(state="normal")
+        self._save_btn.configure(state="normal")
+        self._load_btn.configure(state="normal")
+        self._stop_btn.configure(state="disabled")
+        if returncode == 0:
+            self._last_run_state = "complete"
+            self._set_progress(1.0, "Complete!")
+            self._canvas_status.configure(text="Processing complete!")
+        elif stopped_by_user:
+            self._last_run_state = "stopped"
+            self._set_progress(0.0, "Stopped")
+            self._canvas_status.configure(text=f"Stopped (exit {returncode})")
+        else:
+            self._last_run_state = "failed"
+            self._set_progress(0.0, "Processing failed")
+            log_path = self._batch_log_path or "unavailable"
+            self._canvas_status.configure(text=f"Processing failed (exit {returncode})")
+            messagebox.showerror(
+                "Processing failed",
+                f"Processing failed with exit code {returncode}.\n\n"
+                f"Full log:\n{log_path}",
+            )
+        self._set_post_segmentation_visibility(self._workflow_segmentation_ready)
+        self._update_next_action()
+
+    def _stop_batch(self) -> None:
+        proc = self._batch_proc
+        if proc is None or proc.poll() is not None:
+            self._stop_btn.configure(state="disabled")
+            return
+
+        self._stop_requested = True
+        self._set_progress(self._progress_pct, "Stopping...")
+        try:
+            if sys.platform == "win32":
+                subprocess.run(
+                    ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    check=False,
+                )
+            else:
+                import signal
+                os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+        except Exception as exc:
+            self._stop_requested = False
+            self._stop_btn.configure(state="normal")
+            messagebox.showerror(
+                "Stop failed",
+                f"Failed to stop processing.\n\n{exc}",
+                parent=self,
+            )
+            return
+        self._stop_btn.configure(state="disabled")
+
+    # Load / apply config
+
+    def _load_config(self) -> None:
+        path = filedialog.askopenfilename(
+            title="Load config",
+            filetypes=[("YAML files", "*.yaml *.yml"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        self._load_config_path(path)
+
+    def _load_config_path(
+        self, path: str, *, show_msg: bool = False,
+        expected_video: str | None = None, quiet: bool = False,
+    ) -> bool:
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                cfg = yaml.safe_load(f) or {}
+            cfg = prepare_config_for_gui(cfg, path, parent=self)
+            if expected_video:
+                configured_video = str(cfg.get("TRAINING_VIDEO_PATH", "") or "").strip()
+                if configured_video and (
+                    self._video_path_key(configured_video) != self._video_path_key(expected_video)
+                ):
+                    print(
+                        f"[Easy Tracking] Skipping config for a different training video: {path}",
+                        flush=True,
+                    )
+                    return False
+                if not configured_video:
+                    cfg["TRAINING_VIDEO_PATH"] = expected_video
+            # PICKLE_PATH/BACKGROUND_PATH always live under SESSION_PATH; always
+            # recompute rather than trust whatever an old config.yaml stored, so
+            # a stale value never survives a load.
+            cfg["PICKLE_PATH"], cfg["BACKGROUND_PATH"] = segmentation_paths_for_session(
+                cfg.get("SESSION_PATH", ""),
+                cfg.get("TRAINING_VIDEO_PATH", ""),
+            )
+            self._loaded_cfg = copy.deepcopy(cfg)
+            self._loaded_config_path = path
+            self._apply_config_to_gui(cfg)
+            if show_msg:
+                messagebox.showinfo("Loaded", f"Config loaded from:\n{path}")
+            return True
+        except Exception as e:
+            if quiet:
+                print(f"[Easy Tracking] Could not auto-load config {path}: {e}", flush=True)
+            else:
+                messagebox.showerror("Error", f"Failed to load config:\n{e}")
+            return False
+
+    def _apply_config_to_gui(self, cfg: dict) -> None:
+        cfg = cfg or {}
+        self._progress_config_loaded = True
+        self._progress_details_open = True
+        self._last_run_state = "idle"
+        self._manual_skip_keys.clear()
+
+        # Paths
+        video = str(cfg.get("TRAINING_VIDEO_PATH", "") or "")
+        if video:
+            self._selected_training_video = video
+            self._video_entry.delete(0, tk.END)
+            self._video_entry.insert(0, video)
+        self._last_training_video_for_extras = video
+        configured_training_videos = cfg.get("TRAINING_VIDEO_PATHS") or []
+        if isinstance(configured_training_videos, str):
+            configured_training_videos = [configured_training_videos]
+        self._extra_training_videos = [
+            str(path) for path in configured_training_videos if str(path).strip() and str(path) != video
+        ]
+        self._refresh_training_videos_label()
+        tracking_video = str(cfg.get("TRACKING_VIDEO_PATH", "") or "") or video
+        tracking_video_is_dir = bool(cfg.get("TRACKING_VIDEO_PATH_IS_DIR", False))
+        self._tracking_video_is_dir.set(tracking_video_is_dir)
+        self._reset_prepared_tracking_directory()
+        configured_tracking_files = cfg.get("TRACKING_VIDEO_FILES", [])
+        if (
+            tracking_video_is_dir
+            and os.path.isdir(tracking_video)
+            and isinstance(configured_tracking_files, list)
+            and configured_tracking_files
+            and len(configured_tracking_files)
+            == len(self._tracking_directory_candidates(tracking_video))
+            and all(os.path.isfile(str(path)) for path in configured_tracking_files)
+        ):
+            candidates = self._tracking_directory_candidates(tracking_video)
+            self._prepared_tracking_directory = os.path.normcase(
+                os.path.abspath(tracking_video)
+            )
+            self._prepared_tracking_source_signature = self._tracking_source_signature(
+                candidates
+            )
+            self._prepared_tracking_files = [
+                str(path) for path in configured_tracking_files
+            ]
+        self._tracking_video_entry.configure(state="normal")
+        self._tracking_video_entry.delete(0, tk.END)
+        if tracking_video:
+            self._tracking_video_entry.insert(0, tracking_video)
+        self._refresh_tracking_video_controls()
+        session = cfg.get("SESSION_PATH", "")
+        if session:
+            self._session_entry.delete(0, tk.END)
+            self._session_entry.insert(0, session)
+
+        # Number of animals
+        self._variable_count.set(bool(cfg.get("VARIABLE_NUM_OBJECTS", False)))
+        self._without_direction.set(bool(cfg.get("WITHOUT_DIRECTION_ESTIMATION", False)))
+        self._num_objects_sb.configure(state="normal")
+        num_objects = cfg.get("NUM_OBJECTS", 1)
+        self._num_objects_sb.delete(0, tk.END)
+        num_objects = int(num_objects)
+        self._num_objects_sb.insert(0, str(num_objects))
+        self._confirmed_num_objects = num_objects
+        self._num_confirmed = True
+        if self._single_animal_paste is not None:
+            self._single_animal_paste.set(bool(cfg.get("SINGLE_PASTE", False)))
+        self._apply_individual_count_state()
+
+        self._num_objects_sb.configure(state="disabled" if self._variable_count.get() else "normal")
+        self._num_enter_button.configure(state="disabled" if self._variable_count.get() else "normal")
+
+        # Zero overlap is None; Very heavy is heavy plus embedding-based ID validation.
+        try:
+            min_overlap = float(cfg.get("MIN_OVERLAP", 0.01))
+        except (TypeError, ValueError):
+            min_overlap = 0.01
+        try:
+            max_overlap = float(cfg.get("MAX_OVERLAP", 0.5))
+        except (TypeError, ValueError):
+            max_overlap = 0.5
+        embedding_cfg = cfg.get("EMBEDDING", {}) or {}
+        raw_embedding_enabled = embedding_cfg.get("ENABLE", False)
+        if isinstance(raw_embedding_enabled, bool):
+            embedding_enabled = raw_embedding_enabled
+        elif isinstance(raw_embedding_enabled, (int, float)):
+            embedding_enabled = bool(raw_embedding_enabled)
+        elif isinstance(raw_embedding_enabled, str):
+            embedding_enabled = raw_embedding_enabled.strip().lower() in {"1", "true", "yes", "y", "on"}
+        else:
+            embedding_enabled = bool(raw_embedding_enabled)
+        if min_overlap == 0.0 and max_overlap == 0.0:
+            self._overlap.set("none")
+        elif embedding_enabled:
+            self._overlap.set("super_heavy")
+        elif max_overlap <= 0.2:
+            self._overlap.set("light")
+        else:
+            self._overlap.set("heavy")
+        refine_skipped = cfg.get("skip_refine_blobs_through_tracking", False)
+        self._backward_movement.set("no" if bool(refine_skipped) else "yes")
+        self._delete_tmp_files.set(bool(cfg.get("delete_tmp_files", True)))
+
+        # Paste / cluster controls
+        for key, sb in [
+            ("PASTE_COUNT", self._paste_count_sb),
+            ("CLUSTER_FRAMES", self._cluster_frames_sb),
+            ("CROP_COUNT", self._crop_count_sb),
+            ("MAX_PASTE_PER_FRAME", self._max_paste_sb),
+            ("NUM_IMAGES", self._num_images_sb),
+        ]:
+            if hasattr(self, key.lower() + "_sb"):
+                val = str(cfg.get(key, sb.get()))
+                sb.delete(0, tk.END)
+                sb.insert(0, val)
+
+        loaded_flags = self._skip_flags_from_config(cfg)
+        video = self._video_entry.get().strip()
+        try:
+            loaded_img_size = int(cfg.get("TRAIN_IMG_SIZE", 640))
+        except (TypeError, ValueError):
+            loaded_img_size = 640
+        vw, vh = self._video_dims(video)
+        if vw > 0 and vh > 0:
+            loaded_img_size = self._img_size_from_short(min(vw, vh))
+        self._manual_skip_keys.clear()
+        self._set_skip_flags(loaded_flags, render=True)
+        self._sync_segmentation_status_from_outputs(cfg)
+        self._restore_analysis_rois_from_config(cfg)
+        self._remember_easy_answers()
+
+    # Advanced GUI
+
+    def _existing_config_path(self) -> str:
+        if self._loaded_config_path and os.path.isfile(self._loaded_config_path):
+            return self._loaded_config_path
+        session = self._get_session()
+        if session:
+            candidate = os.path.join(session, "config.yaml")
+            if os.path.isfile(candidate):
+                return candidate
+        return ""
+
+    def _switch_advanced_mode(self) -> None:
+        if self._batch_proc is not None and self._batch_proc.poll() is None:
+            return
+
+        script = str(gui_script("gui_advanced_tracking.py"))
+        cmd = [sys.executable, "-u", script]
+        cmd += ["--without-direction-estimation", str(int(self._without_direction.get()))]
+        cfg_path = self._existing_config_path()
+        if cfg_path:
+            if not self._load_config_path(cfg_path):
+                return
+            cmd += ["--load-config", cfg_path]
+        else:
+            # Advanced Tracking can start without a config. Carry over only the
+            # paths that are already available in Easy Tracking; all other
+            # settings remain Advanced Tracking defaults.
+            video = self._video_entry.get().strip()
+            tracking_video = self._tracking_video_entry.get().strip()
+            session = self._get_session()
+            if session:
+                cmd += ["--session", session]
+            if video:
+                cmd += ["--training-video", video]
+            if tracking_video:
+                cmd += ["--tracking-video", tracking_video]
+            if self._tracking_video_is_dir.get():
+                cmd += ["--tracking-video-is-dir", "1"]
+
+        subprocess.Popen(cmd)
+        self.after(100, self.destroy)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--load-config", dest="load_config", default="")
+    parser.add_argument("--without-direction-estimation", type=int, choices=(0, 1), default=None)
+    parser.add_argument("--video", default="")
+    parser.add_argument("--dropped-video", default="")
+    parser.add_argument("--session", default="")
+    args = parser.parse_args()
+    configure_taskbar_identity()
+    app = EasyTrackingGUI()
+    if args.dropped_video:
+        # Reuse native Easy Tracking D&D: compatibility check, optional
+        # conversion, and automatic session-path derivation.
+        app.after(
+            300,
+            lambda path=args.dropped_video: app._handle_dropped_training_video(path),
+        )
+    elif args.video or args.session:
+        app.after(200, lambda: app._apply_startup_paths(args.video, args.session))
+    if args.load_config and os.path.isfile(args.load_config):
+        app.after(400, lambda p=args.load_config: app._load_config_path(p))
+    if args.without_direction_estimation is not None:
+        app.after(500, lambda: app._without_direction.set(bool(args.without_direction_estimation)))
+    app.mainloop()
+
+
+if __name__ == "__main__":
+    main()

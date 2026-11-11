@@ -1,0 +1,2739 @@
+# Copyright (C) 2026 Yusuke Notomi
+# SPDX-License-Identifier: AGPL-3.0-only
+
+"""Extract single-animal masks and label headings from movement trajectories."""
+
+import csv
+import itertools
+import math
+import os
+import pickle
+import re
+import sys
+from collections import Counter
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+
+import psutil
+from dataclasses import dataclass, field
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+
+import cv2
+import numpy as np
+import yaml
+from batch_utils import evenly_sample_frame_ids, tqdm
+from keypoint_geometry import BodyKeypoints, estimate_body_keypoints, heading_to_unit_vector
+from obb_fitting import fit_obb, normalize_obb_fit_mode
+
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
+from gui.color import OBB_COLOR, OUTLIER_COLOR
+from path_utils import resolve_config_paths
+from tank_roster import filter_records_by_rois
+from track_representation import uses_keypoints
+from main.roi import contour_mask_region, convex_polygon_mask_region, mask_region_overlap
+from image_io import write_png
+from video_frame_count import (
+    clamp_frame_range_to_usable_count,
+    read_frame_info_with_fallback,
+    warn_if_frame_count_adjusted,
+)
+
+_torch = None
+_F = None
+_CUDA_AVAILABLE = False
+_CUDA_BACKEND_CHECKED = False
+
+
+DIRECTION_CLASS_NAMES = [
+    "upper",
+    "upper_right",
+    "right",
+    "lower_right",
+    "lower",
+    "lower_left",
+    "left",
+    "upper_left",
+]
+
+LOW_OBB_ASPECT_REASON = "low_obb_aspect"
+SINGLE_ANIMAL_IMAGES_DIR_NAME = "single_animal_images"
+
+# Bounds of the displacement gate that is derived from the measured motion when
+# the configured DIR_MIN_DISP cannot be reached (see _resolve_min_total_disp).
+MIN_RELAXED_DISP_RATIO = 0.25
+MAX_RELAXED_DISP_RATIO = 0.9
+
+# Donor material for interaction_image_synthesis.py is padded out to this ratio (see
+# _extract_masked_blob_crop) so paste-time mask expansion -- randomized per
+# paste between 1.0 and this value, see paste_blobs.random_mask_expansion_ratio
+# -- always has real source pixels behind it. The single_animal_images frame
+# itself and its background-infill (removal) mask always use the exact,
+# unexpanded contour and never this ratio. Overridable via
+# cfg["MASK_EXPANSION_RATIO"] (Advanced Tracking > Paste > Segmentation Mask).
+DEFAULT_MASK_EXPANSION_RATIO = 1.05
+
+
+def get_mask_expansion_ratio(cfg: dict) -> float:
+    return float(cfg.get("MASK_EXPANSION_RATIO", DEFAULT_MASK_EXPANSION_RATIO))
+
+
+def expand_contour_from_centroid(cnt: np.ndarray, ratio: float) -> np.ndarray:
+    """Scale contour points outward from the centroid by ratio."""
+    m = cv2.moments(cnt)
+    if abs(m["m00"]) > 1e-8:
+        cx, cy = float(m["m10"] / m["m00"]), float(m["m01"] / m["m00"])
+    else:
+        pts0 = cnt.reshape(-1, 2).astype(np.float32)
+        cx, cy = float(np.mean(pts0[:, 0])), float(np.mean(pts0[:, 1]))
+    center = np.asarray([cx, cy], dtype=np.float64)
+    pts = cnt.reshape(-1, 2).astype(np.float64)
+    scaled = center + (pts - center) * float(ratio)
+    return np.round(scaled).astype(np.int32).reshape(cnt.shape)
+
+
+def _load_cuda_backend() -> bool:
+    """Load PyTorch only when the optional GPU writer is explicitly requested."""
+    global _torch, _F, _CUDA_AVAILABLE, _CUDA_BACKEND_CHECKED
+    if _CUDA_BACKEND_CHECKED:
+        return bool(_CUDA_AVAILABLE)
+    _CUDA_BACKEND_CHECKED = True
+    try:
+        import torch as torch_module
+        import torch.nn.functional as functional
+
+        _torch = torch_module
+        _F = functional
+        _CUDA_AVAILABLE = bool(torch_module.cuda.is_available())
+    except ImportError:
+        _torch = None
+        _F = None
+        _CUDA_AVAILABLE = False
+    return bool(_CUDA_AVAILABLE)
+
+
+@dataclass
+class BlobRecord:
+    contour: np.ndarray
+    rect: Tuple[int, int, int, int]
+    center: Tuple[float, float]
+    area: float
+    bbox_area: float
+    w: float
+    h: float
+    pickle_outlier: bool
+    frame: int
+    blob_index: int
+    result_protected: bool = False
+    traj_id: Optional[int] = None
+    class_id: Optional[int] = None
+    direction_vec: Optional[Tuple[float, float]] = None
+    axis_length: Optional[float] = None
+    #: Continuous head direction in degrees; only set on the keypoint path.
+    heading_deg: Optional[float] = None
+
+    area_outlier: bool = False
+    bbox_area_outlier: bool = False
+    width_outlier: bool = False
+    height_outlier: bool = False
+    obb_major_axis_len: Optional[float] = None
+    obb_major_axis_outlier: bool = False
+    obb_aspect_ratio: Optional[float] = None
+    low_obb_aspect_outlier: bool = False
+    jump_distance_px: Optional[float] = None
+    jump_outlier: bool = False
+
+    erase_stage1: bool = False
+    erase_pre_direction: bool = False
+    erase_final: bool = False
+
+    erase_reasons_stage1: List[str] = field(default_factory=list)
+    erase_reasons_pre_direction: List[str] = field(default_factory=list)
+    erase_reasons_final: List[str] = field(default_factory=list)
+    direction_failure_reasons: List[str] = field(default_factory=list)
+    direction_source: str = ""
+    result_rescue_reason: str = ""
+    result_track_id: Optional[int] = None
+    result_blob_coverage: Optional[float] = None
+    segmentation_exclusion: str = ""
+    segmentation_obb_count: int = 0
+    segmentation_source_index: Optional[int] = None
+    source_fragment_indices: Tuple[int, ...] = ()
+    result_source_restored: bool = False
+    result_mask_only: bool = False
+    result_before_reasons: List[str] = field(default_factory=list)
+
+    #: Ordered body landmarks, filled once the direction stage has decided
+    #: which end of the body axis is the head.
+    keypoints: Optional[BodyKeypoints] = None
+
+
+@dataclass(frozen=True)
+class ResultObb:
+    track_id: int
+    cx: float
+    cy: float
+    w: float
+    h: float
+    heading: float
+
+
+def load_pre_result_csv(
+    path: str, frame_ids: Optional[Iterable[int]] = None,
+) -> Dict[int, List[ResultObb]]:
+    """Read headed FBQ results, retaining only requested absolute frames.
+
+    Missing detections/headings are normal Result cells. Malformed schemas,
+    numbers and duplicate/fractional frame indices are errors, not opt-outs.
+    """
+    selected = None if frame_ids is None else set(frame_ids)
+    result: Dict[int, List[ResultObb]] = {}
+    seen_frames = set()
+    usable_count = 0
+    try:
+        with open(path, "r", encoding="utf-8-sig", newline="") as handle:
+            reader = csv.DictReader(handle)
+            names = [str(name).strip() for name in (reader.fieldnames or [])]
+            if len(names) != len(set(names)) or "frame" not in names:
+                raise ValueError("expected unique columns including 'frame'")
+            reader.fieldnames = names
+            track_ids = sorted(int(m.group(1)) for name in names if (m := re.fullmatch(r"cx(\d+)", name)))
+            if not track_ids:
+                raise ValueError("missing cx<ID>, cy<ID>, w<ID>, h<ID>, heading<ID> columns")
+            for tid in track_ids:
+                missing = [f"{key}{tid}" for key in ("cx", "cy", "w", "h", "heading") if f"{key}{tid}" not in names]
+                if missing:
+                    raise ValueError(f"missing columns: {', '.join(missing)}")
+            for row in reader:
+                if None in row or any(value is None for value in row.values()):
+                    raise ValueError(f"row {reader.line_num}: column count does not match the header")
+                frame_value = float(row["frame"])
+                if not math.isfinite(frame_value) or frame_value < 0 or not frame_value.is_integer():
+                    raise ValueError(f"row {reader.line_num}: frame must be a nonnegative integer")
+                fid = int(frame_value)
+                if fid in seen_frames:
+                    raise ValueError(f"row {reader.line_num}: duplicate frame {fid}")
+                seen_frames.add(fid)
+                boxes = []
+                for tid in track_ids:
+                    try:
+                        values = [float(row[f"{key}{tid}"]) if row[f"{key}{tid}"].strip() else float("nan")
+                                  for key in ("cx", "cy", "w", "h", "heading")]
+                    except ValueError as exc:
+                        raise ValueError(f"row {reader.line_num}, ID {tid}: invalid OBB number") from exc
+                    cx, cy, w, h, heading = values
+                    if any(math.isfinite(v) and abs(v) > np.iinfo(np.int32).max / 4 for v in values[:4]):
+                        raise ValueError(f"row {reader.line_num}, ID {tid}: OBB exceeds raster coordinate limits")
+                    if all(math.isfinite(v) for v in values) and w >= h > 0 and 0.0 <= heading <= 360.0:
+                        usable_count += 1
+                    # An unheaded/invalid box with a known centre can still
+                    # establish that two detections share a segmentation blob.
+                    if math.isfinite(cx) and math.isfinite(cy):
+                        boxes.append(ResultObb(tid, *values))
+                if boxes and (selected is None or fid in selected):
+                    result[fid] = boxes
+    except (OSError, ValueError, UnicodeError, csv.Error) as exc:
+        raise ValueError(f"PRE_RESULT_PATH '{path}' could not be read as an FBQ Result CSV: {exc}") from exc
+    if not usable_count:
+        raise ValueError(f"PRE_RESULT_PATH '{path}' contains no usable headed OBBs")
+    return result
+
+
+
+def load_config(path: str) -> dict:
+    with open(path, "r", encoding="utf-8") as f:
+        cfg = yaml.safe_load(f) or {}
+    return resolve_config_paths(cfg)
+
+
+def resolve_num_workers(cfg: dict, section_name: str | None = None, default: Optional[int] = None, cap: Optional[int] = None) -> Optional[int]:
+    """Resolve worker count from GUI/config settings.
+
+    Priority:
+      1. section-specific NUM_WORKERS / WORKERS / N_WORKERS / workers / num_workers
+      2. top-level NUM_WORKERS / WORKERS / N_WORKERS / workers / num_workers
+      3. default
+    Returns None when no value/default is provided, allowing memory-aware auto mode.
+    """
+    keys = ("NUM_WORKERS", "WORKERS", "N_WORKERS", "workers", "num_workers")
+    value = None
+    if section_name:
+        section = cfg.get(section_name, {}) or {}
+        if isinstance(section, dict):
+            for key in keys:
+                if key in section:
+                    value = section[key]
+                    break
+    if value is None:
+        for key in keys:
+            if key in cfg:
+                value = cfg[key]
+                break
+    if value is None or str(value).strip().lower() in {"", "auto", "none"}:
+        if default is None:
+            return None
+        workers = int(default)
+    else:
+        workers = int(value)
+    workers = max(1, workers)
+    if cap is not None:
+        workers = min(workers, max(1, int(cap)))
+    return workers
+
+
+def ensure_dirs(paths: Iterable[str]) -> None:
+    for p in paths:
+        os.makedirs(p, exist_ok=True)
+
+
+def reset_without_crossing_output_dir(out_dir: str, *, preserve_applied_deletions: bool = False) -> None:
+    import shutil
+    keep_names = {"refine"}
+    if not os.path.isdir(out_dir):
+        os.makedirs(out_dir, exist_ok=True)
+        return
+    if preserve_applied_deletions:
+        for name in os.listdir(out_dir):
+            path = os.path.join(out_dir, name)
+            if not re.fullmatch(r"refine_add\d+", name) or not os.path.isfile(os.path.join(path, "delete_blobs_applied.csv")):
+                continue
+            keep_names.add(name)
+            for child in os.listdir(path):
+                if child == "delete_blobs_applied.csv":
+                    continue
+                child_path = os.path.join(path, child)
+                if os.path.isdir(child_path):
+                    shutil.rmtree(child_path)
+                else:
+                    os.remove(child_path)
+    for name in os.listdir(out_dir):
+        if name in keep_names:
+            continue
+        path = os.path.join(out_dir, name)
+        if os.path.isdir(path):
+            shutil.rmtree(path)
+        else:
+            os.remove(path)
+    # Delete refine/original/ so apply_refine_deletions uses the newly generated data.
+    # refine/delete_blobs.csv (user's manual deletion marks) is preserved.
+    original_dir = os.path.join(out_dir, "refine", "original")
+    if os.path.isdir(original_dir):
+        shutil.rmtree(original_dir)
+
+    # refine/original was just invalidated, so any past apply-completion marker
+    # is stale: it would make direction_class_filtering.py skip re-running
+    # apply_class_label_filtering.py against the newly generated data.
+    refine_dir = os.path.join(out_dir, "refine")
+    if os.path.isdir(refine_dir):
+        for name in os.listdir(refine_dir):
+            if name.startswith(".apply_refine_deletions.") and name.endswith(".done"):
+                os.remove(os.path.join(refine_dir, name))
+
+
+def load_refine_delete_map(session_path: str, *, include_applied: bool = False) -> Dict[Tuple[int, int], List[str]]:
+    root = os.path.join(session_path, SINGLE_ANIMAL_IMAGES_DIR_NAME)
+    raw_path = os.path.join(root, "refine", "delete_blobs.csv")
+    paths = [raw_path]
+    automatic_candidates = {"refine_no_prediction", "refine_no_overlap", "refine_direction_mismatch_ge_90deg",
+                            "refine_run_delete_ge_threshold", LOW_OBB_ASPECT_REASON}
+    if include_applied and os.path.isdir(root):
+        paths.extend(os.path.join(root, name, "delete_blobs_applied.csv") for name in sorted(os.listdir(root))
+                     if re.fullmatch(r"refine(?:_add\d+)?", name))
+    out: Dict[Tuple[int, int], List[str]] = {}
+    for path in paths:
+        if not os.path.isfile(path):
+            continue
+        with open(path, "r", encoding="utf-8", newline="") as f:
+            for row in csv.DictReader(f):
+                key = (int(row["frame"]), int(row["blob_index"]))
+                reasons = [x for x in str(row.get("reasons", "")).split("|") if x] or ["refine_delete"]
+                if include_applied and path == raw_path:
+                    # Automatic candidates may have been kept by the run policy.
+                    # Honor its applied decisions and retain explicit custom marks.
+                    reasons = [reason for reason in reasons if reason not in automatic_candidates]
+                for reason in reasons:
+                    append_unique_reason(out.setdefault(key, []), reason)
+    return out
+
+
+def apply_refine_deletions(blob_records: Dict[int, List[BlobRecord]], refine_delete_map: Dict[Tuple[int, int], List[str]]) -> Dict[str, int]:
+    count = 0
+    for fid, records in blob_records.items():
+        for b in records:
+            reasons = list(refine_delete_map.get((int(fid), int(b.blob_index)), []))
+            for index in b.source_fragment_indices:
+                for reason in refine_delete_map.get((int(fid), index), []):
+                    append_unique_reason(reasons, reason)
+            if not reasons:
+                continue
+            b.erase_final = True
+            merged = list(b.erase_reasons_final)
+            for reason in reasons:
+                append_unique_reason(merged, reason)
+            b.erase_reasons_final = merged
+            count += 1
+    return {"refine_deleted": count}
+
+def resolve_blob_sequence(obj):
+    return obj.blobs_in_video
+
+
+def get_frame_blobs(blob_seq, fid: int):
+    return blob_seq[fid]
+
+
+def get_num_blob_frames(blob_seq) -> int:
+    return len(blob_seq)
+
+
+def contour_area(cnt: np.ndarray) -> float:
+    return float(abs(cv2.contourArea(cnt)))
+
+
+def contour_center(cnt: np.ndarray) -> Tuple[float, float]:
+    m = cv2.moments(cnt)
+    if abs(m["m00"]) > 1e-8:
+        return float(m["m10"] / m["m00"]), float(m["m01"] / m["m00"])
+    pts = cnt.reshape(-1, 2).astype(np.float32)
+    return float(np.mean(pts[:, 0])), float(np.mean(pts[:, 1]))
+
+
+def unit_vec(x: float, y: float) -> Optional[np.ndarray]:
+    n = math.hypot(float(x), float(y))
+    if n < 1e-8:
+        return None
+    return np.asarray([float(x) / n, float(y) / n], dtype=np.float32)
+
+
+def iqr_bounds(values: List[float], min_scale: float, max_scale: float) -> Tuple[float, float]:
+    arr = np.asarray(values, dtype=np.float64)
+    if arr.size == 0:
+        return -float("inf"), float("inf")
+    q1 = float(np.percentile(arr, 25))
+    q3 = float(np.percentile(arr, 75))
+    iqr = q3 - q1
+    return q1 - min_scale * iqr, q3 + max_scale * iqr
+
+
+def inside_bounds(v: float, bounds: Tuple[float, float]) -> bool:
+    lo, hi = bounds
+    return bool(lo <= v <= hi)
+
+
+def angle_to_class(dx: float, dy: float) -> int:
+    angle = (math.degrees(math.atan2(dx, -dy)) + 360.0) % 360.0
+    return int(((angle + 22.5) % 360.0) // 45.0)
+
+
+def _obb_geometry_from_contour(
+    cnt: np.ndarray, obb_fit_mode: str = "min_area",
+) -> Tuple[Optional[np.ndarray], float, Optional[float], Optional[np.ndarray]]:
+    pts = np.asarray(cnt, dtype=np.float32).reshape(-1, 2)
+    if pts.shape[0] < 3:
+        return None, 0.0, None, None
+    fit_mode = normalize_obb_fit_mode(obb_fit_mode)
+    rect, fitted_axis = fit_obb(pts, fit_mode)
+    (_, _), (w, h), angle = rect
+    w = float(w)
+    h = float(h)
+    major_axis_len = float(max(w, h))
+    long_side = float(max(w, h))
+    short_side = float(min(w, h))
+
+    axis = None
+    if major_axis_len > 1e-8 and math.isfinite(float(angle)):
+        if fit_mode == "pca":
+            axis = unit_vec(float(fitted_axis[0]), float(fitted_axis[1]))
+        else:
+            axis_angle = float(angle) if w >= h else float(angle) + 90.0
+            theta = math.radians(axis_angle)
+            axis = unit_vec(math.cos(theta), math.sin(theta))
+
+    aspect_ratio = None
+    if long_side > 1e-6:
+        aspect_ratio = float("inf") if short_side <= 1e-6 else long_side / short_side
+
+    return axis, major_axis_len, aspect_ratio, cv2.boxPoints(rect).astype(np.float32)
+
+
+def obb_axis_from_contour(
+    cnt: np.ndarray, obb_fit_mode: str = "min_area",
+) -> Optional[np.ndarray]:
+    axis, _, _, _ = _obb_geometry_from_contour(cnt, obb_fit_mode)
+    return axis
+
+
+def contour_to_obb_points(
+    cnt: np.ndarray, obb_fit_mode: str = "min_area",
+) -> np.ndarray:
+    _, _, _, box_points = _obb_geometry_from_contour(cnt, obb_fit_mode)
+    if box_points is None:
+        raise ValueError("Contour must contain at least 3 points for OBB conversion.")
+    return box_points
+
+
+def get_min_obb_aspect_ratio(cfg: dict) -> float:
+    return float(cfg["MIN_ASPECT"])
+
+
+def resolve_reference_video_path(cfg: dict) -> str:
+    """Return the video the stage reads the frames from.
+
+    The training video is the reference, but a stale path must not abort the
+    analysis: the tracking video of the same run is used instead.
+    """
+    training = str(cfg.get("TRAINING_VIDEO_PATH", "") or "")
+    tracking = str(cfg.get("TRACKING_VIDEO_PATH", "") or "")
+    if training and os.path.isfile(training):
+        return training
+    if tracking and os.path.isfile(tracking):
+        print(
+            f"[WARN] the reference video {training!r} does not exist; "
+            f"reading the frames from {tracking!r} instead.",
+            flush=True,
+        )
+        return tracking
+    return training or tracking
+
+
+def get_source_video_fps(cfg: dict) -> float:
+    """Return the frame rate of the reference video of the run.
+
+    The training video is the reference, but it is only a reference: when it
+    cannot be read the tracking video provides the frame rate instead, so a
+    stale path does not abort the analysis.
+    """
+    candidates = [
+        str(cfg.get("TRAINING_VIDEO_PATH", "") or ""),
+        str(cfg.get("TRACKING_VIDEO_PATH", "") or ""),
+    ]
+    errors = []
+    for video_path in candidates:
+        if not video_path or video_path in errors:
+            continue
+        cap = cv2.VideoCapture(video_path)
+        try:
+            fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+        finally:
+            cap.release()
+        if np.isfinite(fps) and fps > 0.0:
+            return fps
+        errors.append(video_path)
+    raise RuntimeError(
+        "Could not read a positive FPS from the reference video: "
+        + ", ".join(repr(path) for path in errors)
+        + ". Check TRAINING_VIDEO_PATH and TRACKING_VIDEO_PATH in the configuration file."
+    )
+
+
+def resolve_direction_min_valid_frames(cfg: dict) -> Tuple[int, float, float]:
+    fps = get_source_video_fps(cfg)
+    ratio = float(cfg["DIR_MIN_SEC"])
+    if not np.isfinite(ratio) or ratio <= 0.0:
+        raise ValueError(f"DIR_MIN_SEC must be > 0, got {ratio!r}")
+    frames = max(1, int(round(fps * ratio)))
+    return frames, ratio, fps
+
+
+def get_individual_distance_jump_ratio(cfg: dict) -> float:
+    return float(cfg.get("TRAJ_MAX_JUMP", 1.5))
+
+
+def get_individual_distance_disp_ratio(cfg: dict) -> float:
+    return float(cfg.get("DIR_MIN_DISP", 2.0))
+
+
+def get_init_max_dist_ratio(cfg: dict) -> float:
+    return float(cfg.get("INIT_MAX_DIST", 1.5))
+
+
+def get_traj_max_dist_ratio(cfg: dict) -> float:
+    return float(cfg.get("TRAJ_MAX_DIST", 1.5))
+
+
+def yolo_line_from_obb_points(cls_id: int, pts: np.ndarray, W: int, H: int) -> str:
+    pts = np.asarray(pts, dtype=np.float32).reshape(4, 2).copy()
+    pts[:, 0] = np.clip(pts[:, 0] / float(W), 0.0, 1.0)
+    pts[:, 1] = np.clip(pts[:, 1] / float(H), 0.0, 1.0)
+    flat = " ".join(f"{float(v):.6f}" for v in pts.reshape(-1))
+    return f"{int(cls_id)} {flat}\n"
+
+
+def draw_obb(img: np.ndarray, pts: np.ndarray, color: Tuple[int, int, int], thickness: int = 2) -> None:
+    poly = np.asarray(pts, dtype=np.float32).reshape(-1, 2)
+    poly = np.round(poly).astype(np.int32).reshape(-1, 1, 2)
+    cv2.polylines(img, [poly], True, color, thickness, cv2.LINE_AA)
+
+
+def head_angle_deg_from_axis(axis: Tuple[float, float]) -> float:
+    dx, dy = float(axis[0]), float(axis[1])
+    return (math.degrees(math.atan2(dx, -dy)) + 360.0) % 360.0
+
+
+def polygon_line_from_contour(
+    cnt: np.ndarray,
+    class_id: Optional[int] = None,
+    class_name: Optional[str] = None,
+    occlusion_state: Optional[int] = None,
+    is_pasted: Optional[int] = None,
+    overlap_pixels: Optional[int] = None,
+    overlap_ratio: Optional[float] = None,
+) -> str:
+    pts = cnt.reshape(-1, 2)
+    parts: List[str] = []
+    if class_id is not None:
+        parts.append(f"class_id={int(class_id)}")
+    if class_name is not None:
+        parts.append(f"class_name={class_name}")
+    if occlusion_state is not None:
+        parts.append(f"occlusion_state={int(occlusion_state)}")
+    if is_pasted is not None:
+        parts.append(f"is_pasted={int(is_pasted)}")
+    if overlap_pixels is not None:
+        parts.append(f"overlap_pixels={int(overlap_pixels)}")
+    if overlap_ratio is not None:
+        parts.append(f"overlap_ratio={float(overlap_ratio):.6f}")
+    return " | ".join([
+        " ".join(parts),
+        "points=" + " ".join(f"{int(x)},{int(y)}" for x, y in pts),
+    ]) + "\n"
+
+
+def read_background(bg_path: str, frame_shape: Tuple[int, int]) -> np.ndarray:
+    bg = cv2.imread(bg_path)
+    if bg is None:
+        raise FileNotFoundError(bg_path)
+    h, w = frame_shape
+    if (bg.shape[0], bg.shape[1]) != (h, w):
+        # Do not silently resize: contour coordinates are in the video's own
+        # pixel space, so a background of a different size means something is
+        # actually wrong (stale/mismatched background.png), not a harmless
+        # size difference to paper over.
+        raise RuntimeError(
+            f"Background size {(bg.shape[0], bg.shape[1])} does not match "
+            f"video frame size {(h, w)}: {bg_path}"
+        )
+    return bg
+
+
+def load_initial_tracking_csv(csv_path: str) -> Dict[Tuple[int, int], int]:
+    assignments: Dict[Tuple[int, int], int] = {}
+    with open(csv_path, "r", encoding="utf-8", newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            frame = int(row["frame"])
+            blob_index = int(row["blob_index"])
+            track_id = int(row["track_id"])
+            assignments[(frame, blob_index)] = track_id
+    return assignments
+
+def load_tracking_stats_csv(csv_path: str) -> Dict[str, str]:
+    stats: Dict[str, str] = {}
+    with open(csv_path, "r", encoding="utf-8", newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            metric = str(row.get("metric", "")).strip()
+            if not metric:
+                continue
+            stats[metric] = str(row.get("value", "")).strip()
+    return stats
+
+
+def get_required_tracking_stat(stats: Dict[str, str], key: str, cast):
+    if key not in stats or stats[key] == "":
+        raise KeyError(f"Missing '{key}' in initial tracking stats csv.")
+    return cast(stats[key])
+
+
+def build_blob_records(
+    blob_seq, frame_indices: Sequence[int], obb_fit_mode: str = "min_area",
+    *, segmentation_source_blobs: Optional[dict] = None,
+) -> Dict[int, List[BlobRecord]]:
+    """Load emitted masks and recover one candidate for each real source contour."""
+    obb_fit_mode = normalize_obb_fit_mode(obb_fit_mode)
+    out: Dict[int, List[BlobRecord]] = {}
+    for fid in tqdm(frame_indices, desc="Preparing blobs"):
+        records: List[BlobRecord] = []
+        emitted = list(get_frame_blobs(blob_seq, fid))
+        emitted_count = len(emitted)
+        sources = (segmentation_source_blobs or {}).get(int(fid), [])
+        source_groups = {}
+        if sources:
+            for bi, item in enumerate(emitted):
+                source_index = getattr(item, "segmentation_source_index", None)
+                if source_index is not None:
+                    source_groups.setdefault(int(source_index), []).append(bi)
+        mask_only_indices = set()
+        for source in sources:
+            source_index = int(source.segmentation_source_index)
+            group = source_groups.get(source_index, [])
+            same = [bi for bi in group if np.array_equal(np.asarray(emitted[bi].contour).reshape(-1, 2),
+                                                       np.asarray(source.contour).reshape(-1, 2))]
+            if same:
+                continue
+            mask_only_indices.update(group)
+            emitted.append(source)
+        for bi, bl in enumerate(emitted):
+            cnt = np.asarray(bl.contour, dtype=np.int32)
+            if cnt.size == 0:
+                continue
+            x, y, w, h = cv2.boundingRect(cnt)
+            cx, cy = contour_center(cnt)
+            _, obb_major_axis_len, obb_aspect_ratio, _ = _obb_geometry_from_contour(cnt, obb_fit_mode)
+            records.append(
+                BlobRecord(
+                    contour=cnt,
+                    rect=(int(x), int(y), int(w), int(h)),
+                    center=(cx, cy),
+                    area=contour_area(cnt),
+                    bbox_area=float(w * h),
+                    w=float(w),
+                    h=float(h),
+                    obb_major_axis_len=obb_major_axis_len,
+                    obb_aspect_ratio=obb_aspect_ratio,
+                    pickle_outlier=bool(bl.is_outlier),
+                    result_protected=bool(getattr(bl, "result_protected", False)),
+                    frame=int(fid),
+                    blob_index=int(bi),
+                    segmentation_exclusion=str(getattr(bl, "segmentation_exclusion", "")),
+                    segmentation_obb_count=int(getattr(bl, "result_obb_count", 0)),
+                    segmentation_source_index=getattr(bl, "segmentation_source_index", None),
+                    source_fragment_indices=tuple(source_groups.get(getattr(bl, "segmentation_source_index", None), [])),
+                    result_source_restored=bool(bi >= emitted_count),
+                    result_mask_only=bool(bi in mask_only_indices),
+                )
+            )
+        out[int(fid)] = records
+    return out
+
+
+def append_unique_reason(items: List[str], reason: str) -> None:
+    if reason not in items:
+        items.append(reason)
+
+
+def classify_blobs_stage1(
+    blob_records: Dict[int, List[BlobRecord]],
+    cfg: dict,
+    individual_distance_px: float,
+    individual_distance_source_count: int,
+    individual_distance_source_total_non_crossing: int,
+    init_max_dist_px: float,
+) -> Dict[str, Tuple[float, float]]:
+    all_non_crossing = [b for lst in blob_records.values() for b in lst if not b.pickle_outlier and not b.result_mask_only]
+
+    area_values = [b.area for b in all_non_crossing]
+    bbox_values = [b.bbox_area for b in all_non_crossing]
+    w_values = [b.w for b in all_non_crossing]
+    h_values = [b.h for b in all_non_crossing]
+    obb_values = [float(b.obb_major_axis_len or 0.0) for b in all_non_crossing]
+    min_obb_aspect_ratio = get_min_obb_aspect_ratio(cfg)
+
+    area_bounds = (float(np.min(area_values)) if area_values else -float("inf"), float(np.max(area_values)) if area_values else float("inf"))
+    bbox_bounds = (float(np.min(bbox_values)) if bbox_values else -float("inf"), float(np.max(bbox_values)) if bbox_values else float("inf"))
+    w_bounds = (float(np.min(w_values)) if w_values else -float("inf"), float(np.max(w_values)) if w_values else float("inf"))
+    h_bounds = (float(np.min(h_values)) if h_values else -float("inf"), float(np.max(h_values)) if h_values else float("inf"))
+    obb_major_axis_bounds = (float(np.min(obb_values)) if obb_values else -float("inf"), float(np.max(obb_values)) if obb_values else float("inf"))
+
+    for lst in blob_records.values():
+        for b in lst:
+            b.area_outlier = False
+            b.bbox_area_outlier = False
+            b.width_outlier = False
+            b.height_outlier = False
+            b.obb_major_axis_outlier = False
+            b.low_obb_aspect_outlier = False
+
+            reasons: List[str] = []
+            if b.pickle_outlier:
+                reasons.append("pickle_outlier")
+            if b.result_mask_only:
+                reasons.append("segmentation_fragment")
+            if b.result_source_restored:
+                reasons.append("segmentation_source_restored")
+            if str(cfg.get("PRE_RESULT_PATH", "") or "").strip():
+                if b.segmentation_exclusion in {"manual", "synthetic", "result_multiple"}:
+                    reasons.append("segmentation_" + b.segmentation_exclusion)
+                elif b.segmentation_obb_count > 1:
+                    reasons.append("segmentation_result_multiple")
+            if b.obb_aspect_ratio is not None and np.isfinite(b.obb_aspect_ratio):
+                b.low_obb_aspect_outlier = bool(float(b.obb_aspect_ratio) < min_obb_aspect_ratio)
+                if b.low_obb_aspect_outlier:
+                    reasons.append(LOW_OBB_ASPECT_REASON)
+
+            b.erase_reasons_stage1 = reasons
+            b.erase_stage1 = len(reasons) > 0
+            b.erase_pre_direction = b.erase_stage1
+            b.erase_final = b.erase_stage1
+            b.erase_reasons_pre_direction = list(reasons)
+            b.erase_reasons_final = list(reasons)
+
+    jump_threshold_px = individual_distance_px * get_individual_distance_jump_ratio(cfg)
+    direction_min_total_disp_px = individual_distance_px * get_individual_distance_disp_ratio(cfg)
+    min_valid_frames, min_valid_ratio, source_fps = resolve_direction_min_valid_frames(cfg)
+
+    return {
+        "area_bounds": area_bounds,
+        "bbox_bounds": bbox_bounds,
+        "w_bounds": w_bounds,
+        "h_bounds": h_bounds,
+        "obb_major_axis_bounds": obb_major_axis_bounds,
+        "min_obb_aspect_ratio": min_obb_aspect_ratio,
+        "jump_bounds": (0.0, jump_threshold_px),
+        "individual_distance_px": individual_distance_px,
+        "individual_distance_source_count": int(individual_distance_source_count),
+        "individual_distance_source_total_non_crossing": int(individual_distance_source_total_non_crossing),
+        "jump_threshold_px": jump_threshold_px,
+        "init_max_dist_px": float(init_max_dist_px),
+        "traj_max_dist_px": individual_distance_px * get_traj_max_dist_ratio(cfg),
+        "direction_min_valid_frames": (
+            int(min_valid_frames),
+            int(min_valid_frames),
+        ),
+        "direction_min_valid_frames_fps_ratio": (
+            float(min_valid_ratio),
+            float(min_valid_ratio),
+        ),
+        "source_fps": (
+            float(source_fps),
+            float(source_fps),
+        ),
+        "direction_min_total_disp_px": (
+            direction_min_total_disp_px,
+            direction_min_total_disp_px,
+        ),
+        "jump_individual_distance_ratio": (
+            get_individual_distance_jump_ratio(cfg),
+            get_individual_distance_jump_ratio(cfg),
+        ),
+        "disp_individual_distance_ratio": (
+            get_individual_distance_disp_ratio(cfg),
+            get_individual_distance_disp_ratio(cfg),
+        ),
+        "init_max_dist_ratio": (
+            get_init_max_dist_ratio(cfg),
+            get_init_max_dist_ratio(cfg),
+        ),
+        "traj_max_dist_ratio": (
+            get_traj_max_dist_ratio(cfg),
+            get_traj_max_dist_ratio(cfg),
+        ),
+    }
+
+
+def assign_track_ids_from_initial_tracking(
+    blob_records: Dict[int, List[BlobRecord]],
+    assignments: Dict[Tuple[int, int], int],
+) -> None:
+    for fid, blobs in tqdm(blob_records.items(), desc="Loading initial tracking"):
+        for b in blobs:
+            track_id = assignments.get((int(fid), int(b.blob_index)))
+            if track_id is not None:
+                b.traj_id = int(track_id)
+
+
+def classify_jump_outliers_stage1(
+    blob_records: Dict[int, List[BlobRecord]],
+    cfg: dict,
+    individual_distance_px: float,
+) -> Dict[str, object]:
+    jump_threshold_px = individual_distance_px * get_individual_distance_jump_ratio(cfg)
+
+    by_tid: Dict[int, Dict[int, BlobRecord]] = {}
+    for blobs in blob_records.values():
+        for b in blobs:
+            if b.erase_stage1:
+                continue
+            if b.traj_id is None:
+                continue
+            by_tid.setdefault(int(b.traj_id), {})[int(b.frame)] = b
+
+    jump_pairs: List[Tuple[BlobRecord, BlobRecord, float]] = []
+    jump_values: List[float] = []
+    for fid_map in by_tid.values():
+        frames = sorted(fid_map.keys())
+        for prev_fid, curr_fid in zip(frames[:-1], frames[1:]):
+            if curr_fid != prev_fid + 1:
+                continue
+            prev_b = fid_map[prev_fid]
+            curr_b = fid_map[curr_fid]
+            jump = float(math.hypot(
+                float(curr_b.center[0]) - float(prev_b.center[0]),
+                float(curr_b.center[1]) - float(prev_b.center[1]),
+            ))
+            curr_b.jump_distance_px = jump
+            jump_pairs.append((prev_b, curr_b, jump))
+            jump_values.append(jump)
+
+    jump_bounds = (0.0, jump_threshold_px)
+    jump_outlier_count = 0
+    for _, curr_b, jump in jump_pairs:
+        is_outlier = bool(jump > jump_threshold_px)
+        curr_b.jump_outlier = is_outlier
+        if not is_outlier:
+            continue
+        append_unique_reason(curr_b.erase_reasons_stage1, "jump_outlier")
+        curr_b.erase_stage1 = True
+        curr_b.erase_pre_direction = True
+        curr_b.erase_final = True
+        curr_b.erase_reasons_pre_direction = list(curr_b.erase_reasons_stage1)
+        curr_b.erase_reasons_final = list(curr_b.erase_reasons_stage1)
+        jump_outlier_count += 1
+
+    return {
+        "jump_bounds": jump_bounds,
+        "jump_threshold_px": jump_threshold_px,
+        "jump_pair_count": len(jump_pairs),
+        "jump_outlier_count": jump_outlier_count,
+        "jump_mean_px": float(np.mean(np.asarray(jump_values, dtype=np.float64))) if jump_values else 0.0,
+    }
+
+
+def split_runs(frames: List[int], max_gap: int = 1) -> List[List[int]]:
+    if not frames:
+        return []
+    runs: List[List[int]] = []
+    cur = [frames[0]]
+    for f in frames[1:]:
+        if f - cur[-1] <= max_gap:
+            cur.append(f)
+        else:
+            runs.append(cur)
+            cur = [f]
+    runs.append(cur)
+    return runs
+
+
+def build_pre_direction_run_rows(blob_records: Dict[int, List[BlobRecord]]) -> List[Dict[str, object]]:
+    by_tid: Dict[int, Dict[int, BlobRecord]] = {}
+    for blobs in blob_records.values():
+        for b in blobs:
+            if b.erase_pre_direction:
+                continue
+            if b.traj_id is None:
+                continue
+            by_tid.setdefault(int(b.traj_id), {})[int(b.frame)] = b
+
+    rows: List[Dict[str, object]] = []
+    run_id = 0
+    for traj_id in sorted(by_tid.keys()):
+        fid_map = by_tid[traj_id]
+        frames = sorted(fid_map.keys())
+        for run_frames in split_runs(frames, max_gap=1):
+            if not run_frames:
+                continue
+            rows.append({
+                "run_id": run_id,
+                "traj_id": traj_id,
+                "start_frame": int(run_frames[0]),
+                "end_frame": int(run_frames[-1]),
+                "run_frame_count": len(run_frames),
+            })
+            run_id += 1
+    return rows
+
+
+def save_pre_direction_run_csv(blob_records: Dict[int, List[BlobRecord]], out_dir: str) -> str:
+    path = os.path.join(out_dir, "pre_direction_runs.csv")
+    rows = build_pre_direction_run_rows(blob_records)
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=[
+                "run_id",
+                "traj_id",
+                "start_frame",
+                "end_frame",
+                "run_frame_count",
+            ],
+        )
+        writer.writeheader()
+        writer.writerows(rows)
+    return path
+
+
+def classify_blobs_pre_direction(blob_records: Dict[int, List[BlobRecord]], cfg: dict) -> Dict[str, int]:
+    min_valid_frames, _, _ = resolve_direction_min_valid_frames(cfg)
+
+    by_tid: Dict[int, Dict[int, BlobRecord]] = {}
+    unmatched_count = 0
+
+    for lst in blob_records.values():
+        for b in lst:
+            b.erase_pre_direction = True
+            b.erase_reasons_pre_direction = list(b.erase_reasons_stage1)
+            if b.erase_stage1:
+                continue
+            if b.traj_id is None:
+                append_unique_reason(b.erase_reasons_pre_direction, "traj_unmatched")
+                unmatched_count += 1
+                continue
+            by_tid.setdefault(int(b.traj_id), {})[int(b.frame)] = b
+
+    short_run_count = 0
+    kept_for_direction = 0
+
+    for fid_map in by_tid.values():
+        frames = sorted(fid_map.keys())
+        if not frames:
+            continue
+
+        run_start = 0
+        while run_start < len(frames):
+            run_end = run_start + 1
+            while run_end < len(frames) and frames[run_end] == frames[run_end - 1] + 1:
+                run_end += 1
+
+            run_frames = frames[run_start:run_end]
+            run_len = len(run_frames)
+            is_short = run_len <= min_valid_frames
+
+            for fid in run_frames:
+                b = fid_map[fid]
+                if is_short:
+                    append_unique_reason(b.erase_reasons_pre_direction, "short_run")
+                    b.erase_pre_direction = True
+                    short_run_count += 1
+                else:
+                    b.erase_pre_direction = False
+                    b.erase_reasons_pre_direction = list(b.erase_reasons_stage1)
+                    kept_for_direction += 1
+
+            run_start = run_end
+
+    return {
+        "pre_direction_unmatched": unmatched_count,
+        "pre_direction_short_run": short_run_count,
+        "pre_direction_kept": kept_for_direction,
+    }
+
+
+def _collect_run_displacements(blob_records: Dict[int, List[BlobRecord]]) -> List[float]:
+    """Net displacement of every trajectory run, in pixels.
+
+    The runs are the same ones the direction estimation walks, so the values
+    are directly comparable with the displacement gate.
+    """
+    by_tid: Dict[int, Dict[int, BlobRecord]] = {}
+    for lst in blob_records.values():
+        for b in lst:
+            if b.erase_pre_direction or b.traj_id is None:
+                continue
+            by_tid.setdefault(int(b.traj_id), {})[int(b.frame)] = b
+
+    displacements: List[float] = []
+    for fid_map in by_tid.values():
+        frames = sorted(fid_map.keys())
+        for run_frames in split_runs(frames, max_gap=1):
+            points: List[np.ndarray] = []
+            for fid in run_frames:
+                center = np.asarray(fid_map[fid].center, dtype=np.float32)
+                if np.all(np.isfinite(center)):
+                    points.append(center)
+            if len(points) < 2:
+                continue
+            displacements.append(float(np.linalg.norm(points[-1] - points[0])))
+    return displacements
+
+
+def _resolve_min_total_disp(
+    blob_records: Dict[int, List[BlobRecord]],
+    cfg: dict,
+    individual_distance_px: float,
+    min_total_disp: float,
+) -> float:
+    """Lower the displacement gate when the configured one cannot be reached.
+
+    The gate asks for a net travel of DIR_MIN_DISP body lengths, which a short
+    clip can leave unfulfilled even though the fish clearly moved. When no
+    trajectory reaches the configured gate, the gate is derived from the
+    measured motion instead, so the stage still produces training data. A clip
+    without real motion keeps the configured gate: the relaxed ratio never
+    drops below MIN_RELAXED_DISP_RATIO body lengths.
+    """
+    if not bool(cfg.get("AUTO_PARAMS", True)):
+        return min_total_disp
+    if individual_distance_px <= 0.0:
+        return min_total_disp
+
+    displacements = _collect_run_displacements(blob_records)
+    if not displacements:
+        return min_total_disp
+    best = max(displacements)
+    if best >= min_total_disp:
+        return min_total_disp
+
+    best_ratio = best / individual_distance_px
+    relaxed_ratio = min(max(0.5 * best_ratio, MIN_RELAXED_DISP_RATIO), MAX_RELAXED_DISP_RATIO)
+    relaxed_px = relaxed_ratio * individual_distance_px
+    if relaxed_px >= min_total_disp:
+        return min_total_disp
+
+    configured_ratio = get_individual_distance_disp_ratio(cfg)
+    print(
+        f"[direction] no trajectory reached the configured displacement gate "
+        f"({configured_ratio:.2f} body lengths = {min_total_disp:.1f} px); "
+        f"the longest one moved {best:.1f} px ({best_ratio:.2f} body lengths)",
+        flush=True,
+    )
+    print(
+        f"[direction] the displacement gate is relaxed to {relaxed_ratio:.2f} body lengths "
+        f"({relaxed_px:.1f} px) because the clip is too short for the configured value; "
+        f"set DIR_MIN_DISP in the configuration to keep the strict gate",
+        flush=True,
+    )
+    return relaxed_px
+
+
+def estimate_directions(
+    blob_records: Dict[int, List[BlobRecord]],
+    cfg: dict,
+    individual_distance_px: float,
+    min_total_disp: Optional[float] = None,
+) -> Dict[str, int]:
+    if min_total_disp is None:
+        min_total_disp = individual_distance_px * get_individual_distance_disp_ratio(cfg)
+    # Guards the mv/sp normalization below against near-zero-motion frames;
+    # not derived from a configurable ratio (see removed DIR_MIN_SPEED).
+    eps_speed = 1e-6
+    # On the keypoint path the heading comes from the head landmark, so it
+    # stays continuous instead of being quantized to the eight classes.
+    use_keypoints = uses_keypoints(cfg)
+
+    by_tid: Dict[int, Dict[int, BlobRecord]] = {}
+    for lst in blob_records.values():
+        for b in lst:
+            if b.erase_pre_direction or b.traj_id is None:
+                continue
+            by_tid.setdefault(int(b.traj_id), {})[int(b.frame)] = b
+
+    stats = {
+        "direction_input_blobs": sum(1 for lst in blob_records.values() for b in lst if not b.erase_pre_direction),
+        "valid_segments": 0,
+        "direction_assigned_blobs": 0,
+    }
+
+    for tid, fid_map in tqdm(by_tid.items(), desc="Estimating directions"):
+        frames = sorted(fid_map.keys())
+        for run_frames in split_runs(frames, max_gap=1):
+            valid_blobs: List[BlobRecord] = []
+            axes: List[np.ndarray] = []
+            centers: List[np.ndarray] = []
+
+            for fid in run_frames:
+                b = fid_map[fid]
+                axis = obb_axis_from_contour(b.contour, cfg.get("OBB_FIT_MODE", "min_area"))
+                if axis is None:
+                    append_unique_reason(b.direction_failure_reasons, "axis_invalid")
+                    continue
+                center = np.asarray(b.center, dtype=np.float32)
+                if not np.all(np.isfinite(center)):
+                    append_unique_reason(b.direction_failure_reasons, "center_invalid")
+                    continue
+                valid_blobs.append(b)
+                axes.append(axis.astype(np.float32))
+                centers.append(center)
+
+            if len(valid_blobs) < 2:
+                for b in valid_blobs:
+                    append_unique_reason(b.direction_failure_reasons, "insufficient_valid_frames")
+                continue
+
+            axes_arr = np.asarray(axes, dtype=np.float32)
+            centers_arr = np.asarray(centers, dtype=np.float32)
+
+            # ``flips`` records the sign applied to each raw body axis so that
+            # consecutive frames agree. The same sign decides whether the
+            # head sits at the positive or the negative end of the axis.
+            flips = np.ones(len(axes_arr), dtype=np.float32)
+            for i in range(1, len(axes_arr)):
+                if float(np.dot(axes_arr[i - 1], axes_arr[i])) < 0.0:
+                    axes_arr[i] *= -1.0
+                    flips[i] = -1.0
+
+            move = np.zeros_like(centers_arr)
+            move[1:-1] = (centers_arr[2:] - centers_arr[:-2]) / 2.0
+            move[0] = centers_arr[1] - centers_arr[0]
+            move[-1] = centers_arr[-1] - centers_arr[-2]
+
+            total_disp = float(np.linalg.norm(centers_arr[-1] - centers_arr[0]))
+
+            if total_disp < min_total_disp:
+                for b in valid_blobs:
+                    append_unique_reason(b.direction_failure_reasons, "disp_too_small")
+                continue
+
+            score_pos = 0.0
+            score_neg = 0.0
+            used_motion_count = 0
+            for axis, mv in zip(axes_arr, move):
+                sp = float(np.linalg.norm(mv))
+                if sp < eps_speed:
+                    continue
+                used_motion_count += 1
+                d = float(np.dot(axis, mv / sp))
+                score_pos += sp * d
+                score_neg += sp * (-d)
+
+            if used_motion_count == 0:
+                for b in valid_blobs:
+                    append_unique_reason(b.direction_failure_reasons, "motion_ambiguous")
+                continue
+
+            global_flip = 1.0
+            if score_neg > score_pos:
+                axes_arr *= -1.0
+                global_flip = -1.0
+
+            stats["valid_segments"] += 1
+            assigned_in_segment = 0
+            for index, (b, axis) in enumerate(zip(valid_blobs, axes_arr)):
+                u = unit_vec(float(axis[0]), float(axis[1]))
+                if u is None:
+                    append_unique_reason(b.direction_failure_reasons, "direction_norm_invalid")
+                    continue
+                dx, dy = float(u[0]), float(u[1])
+                axis_length = contour_axis_length(b.center, (dx, dy), b.contour)
+                if axis_length is None:
+                    append_unique_reason(b.direction_failure_reasons, "axis_length_invalid")
+                    continue
+
+                keypoints = estimate_body_keypoints(
+                    b.contour,
+                    obb_fit_mode=cfg.get("OBB_FIT_MODE", "min_area"),
+                )
+                if keypoints is not None:
+                    sign = float(keypoints.head_sign) * float(flips[index]) * global_flip
+                    b.keypoints = keypoints.with_head_sign(sign)
+
+                direction_x, direction_y = dx, dy
+                heading_deg = None
+                if use_keypoints and b.keypoints is not None:
+                    heading_vec = heading_to_unit_vector(b.keypoints.heading_deg)
+                    if heading_vec is not None:
+                        direction_x, direction_y = heading_vec
+                        heading_deg = float(b.keypoints.heading_deg)
+
+                b.class_id = int(angle_to_class(direction_x, direction_y))
+                b.direction_vec = (direction_x, direction_y)
+                b.axis_length = float(axis_length)
+                b.heading_deg = heading_deg
+                b.direction_failure_reasons.clear()
+                assigned_in_segment += 1
+            stats["direction_assigned_blobs"] += assigned_in_segment
+
+    for lst in blob_records.values():
+        for b in lst:
+            if b.erase_pre_direction:
+                b.erase_final = True
+                b.erase_reasons_final = list(b.erase_reasons_pre_direction)
+                continue
+            if b.class_id is None:
+                b.erase_final = True
+                reasons = list(b.erase_reasons_pre_direction)
+                for r in b.direction_failure_reasons:
+                    append_unique_reason(reasons, r)
+                if not reasons:
+                    reasons.append("direction_unassigned")
+                b.erase_reasons_final = reasons
+            else:
+                b.erase_final = False
+                b.erase_reasons_final = []
+
+    return stats
+
+
+def _result_obb_points(box: ResultObb) -> Optional[np.ndarray]:
+    if not all(math.isfinite(v) for v in (box.cx, box.cy, box.w, box.h, box.heading)):
+        return None
+    if not (box.w >= box.h > 0 and 0.0 <= box.heading <= 360.0):
+        return None
+    # Match OpenCV's contour-fit rectangle representation, including exact
+    # cardinal rotations; hand-built sin/cos corners can perturb shared edges.
+    return cv2.boxPoints(((box.cx, box.cy), (box.w, box.h), (box.heading - 90.0) % 180.0))
+
+
+def _result_obb_iou(blob_obb: np.ndarray, box: ResultObb) -> float:
+    """Intersect canonical long/short rectangles, including coincident edges."""
+    center, (w, h), angle = cv2.minAreaRect(blob_obb)
+    if h > w:
+        w, h, angle = h, w, angle + 90.0
+    blob_rect = (center, (w, h), angle % 180.0)
+    result_rect = ((box.cx, box.cy), (box.w, box.h), (box.heading - 90.0) % 180.0)
+    status, points = cv2.rotatedRectangleIntersection(blob_rect, result_rect)
+    if status == cv2.INTERSECT_NONE:
+        return 0.0
+    blob_area, result_area = float(w * h), float(box.w * box.h)
+    intersection = (
+        min(blob_area, result_area) if status == cv2.INTERSECT_FULL
+        else float(cv2.contourArea(cv2.convexHull(points)))
+    )
+    union = blob_area + result_area - intersection
+    return intersection / union if union > 0 else 0.0
+
+
+def rescue_directions_from_result(
+    blob_records: Dict[int, List[BlobRecord]],
+    cfg: dict,
+    result_by_frame: Dict[int, List[ResultObb]],
+    refine_deleted_keys: Iterable[Tuple[int, int]] = (),
+    *, image_shape: Tuple[int, int],
+) -> Dict[str, object]:
+    """Rescue direction or Stage 1 exclusions using verified real source masks.
+
+    Imported IDs are audit information only. Trajectories, source contours,
+    Segmentation outliers, manual/synthetic exclusions, mixed contours and
+    explicit refinement deletions remain excluded. Generated erase masks never
+    become donors.
+    """
+    direction_reasons = {
+        "disp_too_small", "motion_ambiguous", "short_run", "traj_unmatched",
+        "insufficient_valid_frames", "direction_unassigned",
+    }
+    statistical_reasons = {
+        "pickle_outlier", "low_obb_aspect", "jump_outlier", "area_outlier",
+        "bbox_area_outlier", "width_outlier", "height_outlier", "obb_major_axis_outlier",
+        "segmentation_source_restored",
+    }
+    deleted = set(refine_deleted_keys)
+    stats = Counter(trajectory_accepted_blobs=0, result_rescue_candidates=0,
+                    result_rescued_blobs=0, result_rescue_failed_blobs=0,
+                    result_rescue_ineligible_blobs=0)
+    fit_mode = cfg.get("OBB_FIT_MODE", "min_area")
+    for fid, blobs in blob_records.items():
+        if all(not b.erase_final and not b.pickle_outlier and b.class_id is not None and not b.result_mask_only
+               and b.segmentation_exclusion not in {"manual", "synthetic", "result_multiple"}
+               and b.segmentation_obb_count <= 1 and (fid, b.blob_index) not in deleted
+               and all((fid, index) not in deleted for index in b.source_fragment_indices) for b in blobs):
+            for blob in blobs:
+                if not blob.direction_source:
+                    blob.direction_source = "trajectory"
+            stats["trajectory_accepted_blobs"] += len(blobs)
+            continue
+        boxes = result_by_frame.get(fid, [])
+        polygons = [_result_obb_points(box) for box in boxes]
+        obb_regions = [convex_polygon_mask_region(poly, image_shape) if poly is not None else None
+                       for poly in polygons]
+        blob_regions = []
+        areas = []
+        overlaps = np.zeros((len(blobs), len(boxes)), dtype=np.int64)
+        for bi, blob in enumerate(blobs):
+            region = contour_mask_region(blob.contour, image_shape)
+            blob_regions.append(region)
+            areas.append(cv2.countNonZero(region[2]) if region[2].size else 0)
+            for ri, obb_region in enumerate(obb_regions):
+                if obb_region is not None:
+                    overlaps[bi, ri] = mask_region_overlap(region, obb_region)
+        geometry_indices = [bi for bi, blob in enumerate(blobs) if not blob.result_mask_only
+                            and blob.segmentation_exclusion not in {"synthetic", "manual"}]
+        manual_regions = [blob_regions[bi] for bi, blob in enumerate(blobs)
+                          if blob.segmentation_exclusion == "manual"]
+        owners = []
+        for ri, box in enumerate(boxes):
+            inside = [bi for bi in geometry_indices
+                      if cv2.pointPolygonTest(blobs[bi].contour, (box.cx, box.cy), False) >= 0]
+            if inside:
+                owners.append(inside[0] if len(inside) == 1 else -1)
+            elif geometry_indices and overlaps[geometry_indices, ri].max() > 0:
+                maximum = overlaps[geometry_indices, ri].max()
+                best = [bi for bi in geometry_indices if overlaps[bi, ri] == maximum]
+                owners.append(best[0] if len(best) == 1 else -1)
+            else:
+                owners.append(-1)
+
+        for bi, blob in enumerate(blobs):
+            is_deleted = (fid, blob.blob_index) in deleted or any(
+                (fid, index) in deleted for index in blob.source_fragment_indices)
+            if is_deleted:
+                blob.erase_final = True
+                append_unique_reason(blob.erase_reasons_final, "refine_deleted")
+            if blob.result_mask_only or blob.segmentation_exclusion in {"manual", "synthetic", "result_multiple"} or blob.segmentation_obb_count > 1:
+                blob.erase_final = True
+            if blob.class_id is not None and not blob.direction_source:
+                blob.direction_source = "trajectory"
+            if not blob.erase_final and not blob.pickle_outlier and blob.class_id is not None:
+                stats["trajectory_accepted_blobs"] += 1
+                continue
+
+            def reject(reason: str) -> None:
+                blob.result_rescue_reason = reason
+                stats[f"result_rescue_rejected:{reason}"] += 1
+
+            blob.result_before_reasons = list(blob.erase_reasons_final)
+            if blob.segmentation_exclusion:
+                append_unique_reason(blob.result_before_reasons, "segmentation:" + blob.segmentation_exclusion)
+            if is_deleted:
+                stats["result_rescue_ineligible_blobs"] += 1
+                reject("refine_deleted")
+                continue
+            if blob.result_mask_only:
+                stats["result_rescue_ineligible_blobs"] += 1
+                reject("source_fragment")
+                continue
+            if blob.segmentation_exclusion in {"manual", "synthetic", "result_multiple"} or blob.segmentation_obb_count > 1:
+                stats["result_rescue_ineligible_blobs"] += 1
+                reject("segmentation_" + ("result_multiple" if blob.segmentation_obb_count > 1 else blob.segmentation_exclusion))
+                continue
+            if blob.pickle_outlier:
+                blob.erase_final = True
+                append_unique_reason(blob.erase_reasons_final, "pickle_outlier")
+                stats["result_rescue_ineligible_blobs"] += 1
+                reject("segmentation_outlier")
+                continue
+            reasons = set(blob.erase_reasons_final)
+            if not reasons and blob.class_id is None:
+                reasons = {"direction_unassigned"}
+                append_unique_reason(blob.result_before_reasons, "direction_unassigned")
+            if not reasons <= direction_reasons | statistical_reasons:
+                stats["result_rescue_ineligible_blobs"] += 1
+                reject("non_reassessable_exclusion")
+                continue
+            stats["result_rescue_candidates"] += 1
+            if blob.area <= 0 or areas[bi] <= 0 or not np.all(np.isfinite(blob.center)):
+                reject("invalid_segmentation")
+                continue
+            points = blob.contour.reshape(-1, 2)
+            if np.any(points[:, 0] < 0) or np.any(points[:, 0] >= image_shape[1]) or \
+                    np.any(points[:, 1] < 0) or np.any(points[:, 1] >= image_shape[0]):
+                reject("segmentation_outside_frame")
+                continue
+            if any(mask_region_overlap(blob_regions[bi], region) > 0 for region in manual_regions):
+                reject("manual_exclusion_overlap")
+                continue
+            if not boxes:
+                reject("no_result_frame")
+                continue
+            owned = [ri for ri, owner in enumerate(owners) if owner == bi]
+            if not owned:
+                reject("no_matching_obb")
+                continue
+            if len(owned) != 1:
+                reject("multiple_result_obbs")
+                continue
+            ri = owned[0]
+            box, poly = boxes[ri], polygons[ri]
+            blob.result_track_id = box.track_id
+            if not math.isfinite(box.heading) or not 0.0 <= box.heading <= 360.0:
+                reject("heading_invalid")
+                continue
+            if poly is None:
+                reject("invalid_obb")
+                continue
+            if cv2.pointPolygonTest(blob.contour, (box.cx, box.cy), False) < 0:
+                reject("center_outside_blob")
+                continue
+            coverage = float(overlaps[bi, ri]) / max(1, areas[bi])
+            blob.result_blob_coverage = coverage
+            if coverage < 0.85:
+                reject("insufficient_blob_coverage")
+                continue
+            if sum(overlaps[bi, rj] / max(1, areas[bi]) > 0.1 for rj in range(len(boxes))) > 1:
+                reject("competing_result_obb")
+                continue
+            if any(overlaps[bj, ri] / max(1, areas[bj]) > 0.1 and overlaps[bj, ri] > 0.05 * areas[bi]
+                   for bj in geometry_indices if bj != bi):
+                reject("obb_spans_multiple_blobs")
+                continue
+            if any(bj != bi and mask_region_overlap(blob_regions[bi], blob_regions[bj]) > 0
+                   for bj in geometry_indices):
+                reject("overlapping_segmentation")
+                continue
+            axis, long_side, aspect, blob_obb = _obb_geometry_from_contour(blob.contour, fit_mode)
+            if axis is None or aspect is None or aspect < 1.25:
+                reject("axis_ambiguous")
+                continue
+            short_side = long_side / aspect
+            if not (0.70 <= box.w / long_side <= 1.40 and short_side > 0 and 0.70 <= box.h / short_side <= 1.40):
+                reject("obb_size_mismatch")
+                continue
+            theta = math.radians(box.heading % 360.0)
+            direction = (math.sin(theta), -math.cos(theta))
+            if abs(float(np.dot(axis, direction))) < math.cos(math.radians(20.0)):
+                reject("heading_axis_mismatch")
+                continue
+            if _result_obb_iou(blob_obb, box) < 0.6:
+                reject("obb_shape_mismatch")
+                continue
+            length = contour_axis_length(blob.center, direction, blob.contour)
+            if length is None:
+                reject("axis_length_invalid")
+                continue
+            blob.class_id = angle_to_class(*direction)
+            blob.direction_vec = direction
+            blob.axis_length = length
+            blob.direction_source = "result"
+            blob.result_rescue_reason = "rescued"
+            blob.result_protected = True
+            blob.erase_final = False
+            blob.erase_reasons_final = []
+            stats["result_rescued_blobs"] += 1
+            for reason in blob.result_before_reasons:
+                stats["result_rescue_before:" + reason] += 1
+    stats["result_rescue_failed_blobs"] = stats["result_rescue_candidates"] - stats["result_rescued_blobs"]
+    stats["result_rescue_final_kept_blobs"] = sum(b.class_id is not None and not b.erase_final
+                                                for rows in blob_records.values() for b in rows)
+    stats["result_rescue_source_blobs"] = sum(not b.result_mask_only and b.segmentation_exclusion != "synthetic"
+                                            for rows in blob_records.values() for b in rows)
+    stats["result_rescue_erase_mask_blobs"] = sum(b.result_mask_only or b.segmentation_exclusion == "synthetic"
+                                                for rows in blob_records.values() for b in rows)
+    baseline_count = stats["trajectory_accepted_blobs"]
+    stats["result_rescue_gain_ratio"] = stats["result_rescued_blobs"] / baseline_count if baseline_count else "n/a"
+    stats["result_rescue_gain_percent"] = 100 * stats["result_rescued_blobs"] / baseline_count if baseline_count else "n/a"
+    return dict(stats)
+
+
+def save_blob_classification_csv(blob_records: Dict[int, List[BlobRecord]], bounds: Dict[str, Tuple[float, float]], out_dir: str, include_result_info: bool = False) -> str:
+    path = os.path.join(out_dir, "blob_classification.csv")
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            "frame",
+            "blob_index",
+            "rect_x",
+            "rect_y",
+            "rect_w",
+            "rect_h",
+            "center_x",
+            "center_y",
+            "area",
+            "bbox_area",
+            "pickle_outlier",
+            "area_outlier",
+            "bbox_area_outlier",
+            "width_outlier",
+            "height_outlier",
+            "obb_major_axis_len",
+            "obb_major_axis_outlier",
+            "obb_aspect_ratio",
+            "min_obb_aspect_ratio",
+            "low_obb_aspect_outlier",
+            "individual_distance_px",
+            "jump_threshold_px",
+            "init_max_dist_px",
+            "traj_max_dist_px",
+            "direction_min_total_disp_threshold_px",
+            "jump_distance_px",
+            "jump_outlier",
+            "erase_stage1",
+            "erase_stage1_reasons",
+            "traj_id",
+            "erase_pre_direction",
+            "erase_pre_direction_reasons",
+            "class_id",
+            "direction_name",
+            "direction_dx",
+            "direction_dy",
+            "axis_length",
+            "head_angle_deg",
+            "erase_final",
+            "erase_final_reasons",
+            "direction_failure_reasons",
+            "area_lo",
+            "area_hi",
+            "bbox_lo",
+            "bbox_hi",
+            "w_lo",
+            "w_hi",
+            "h_lo",
+            "h_hi",
+            "obb_major_axis_lo",
+            "obb_major_axis_hi",
+            "jump_lo",
+            "jump_hi",
+        ] + (["direction_source", "result_rescue_reason", "result_track_id", "result_blob_coverage",
+              "segmentation_exclusion", "segmentation_source_index", "result_source_restored",
+              "result_mask_only", "result_before_reasons"]
+             if include_result_info else []))
+        for fid in sorted(blob_records.keys()):
+            for b in blob_records[fid]:
+                dx = "" if b.direction_vec is None else f"{b.direction_vec[0]:.6f}"
+                dy = "" if b.direction_vec is None else f"{b.direction_vec[1]:.6f}"
+                axis_length = "" if b.axis_length is None else f"{float(b.axis_length):.6f}"
+                head_angle_deg = "" if b.direction_vec is None else f"{head_angle_deg_from_axis(b.direction_vec):.6f}"
+                writer.writerow([
+                    b.frame,
+                    b.blob_index,
+                    b.rect[0],
+                    b.rect[1],
+                    b.rect[2],
+                    b.rect[3],
+                    f"{b.center[0]:.3f}",
+                    f"{b.center[1]:.3f}",
+                    f"{b.area:.3f}",
+                    f"{b.bbox_area:.3f}",
+                    int(b.pickle_outlier),
+                    int(b.area_outlier),
+                    int(b.bbox_area_outlier),
+                    int(b.width_outlier),
+                    int(b.height_outlier),
+                    "" if b.obb_major_axis_len is None else f"{b.obb_major_axis_len:.3f}",
+                    int(b.obb_major_axis_outlier),
+                    "" if b.obb_aspect_ratio is None else f"{b.obb_aspect_ratio:.6f}",
+                    f"{float(bounds['min_obb_aspect_ratio']):.6f}",
+                    int(b.low_obb_aspect_outlier),
+                    f"{float(bounds.get('individual_distance_px', 0.0)):.3f}",
+                    f"{float(bounds.get('jump_threshold_px', 0.0)):.3f}",
+                    f"{float(bounds.get('init_max_dist_px', 0.0)):.3f}",
+                    f"{float(bounds.get('traj_max_dist_px', 0.0)):.3f}",
+                    f"{float(bounds.get('direction_min_total_disp_px', (0.0, 0.0))[0]):.3f}",
+                    "" if b.jump_distance_px is None else f"{b.jump_distance_px:.3f}",
+                    int(b.jump_outlier),
+                    int(b.erase_stage1),
+                    "|".join(b.erase_reasons_stage1),
+                    -1 if b.traj_id is None else b.traj_id,
+                    int(b.erase_pre_direction),
+                    "|".join(b.erase_reasons_pre_direction),
+                    -1 if b.class_id is None else b.class_id,
+                    "" if b.class_id is None else DIRECTION_CLASS_NAMES[b.class_id],
+                    dx,
+                    dy,
+                    axis_length,
+                    head_angle_deg,
+                    int(b.erase_final),
+                    "|".join(b.erase_reasons_final),
+                    "|".join(b.direction_failure_reasons),
+                    f"{bounds['area_bounds'][0]:.3f}",
+                    f"{bounds['area_bounds'][1]:.3f}",
+                    f"{bounds['bbox_bounds'][0]:.3f}",
+                    f"{bounds['bbox_bounds'][1]:.3f}",
+                    f"{bounds['w_bounds'][0]:.3f}",
+                    f"{bounds['w_bounds'][1]:.3f}",
+                    f"{bounds['h_bounds'][0]:.3f}",
+                    f"{bounds['h_bounds'][1]:.3f}",
+                    f"{bounds['obb_major_axis_bounds'][0]:.3f}",
+                    f"{bounds['obb_major_axis_bounds'][1]:.3f}",
+                    f"{bounds['jump_bounds'][0]:.3f}" if np.isfinite(bounds['jump_bounds'][0]) else str(bounds['jump_bounds'][0]),
+                    f"{bounds['jump_bounds'][1]:.3f}" if np.isfinite(bounds['jump_bounds'][1]) else str(bounds['jump_bounds'][1]),
+                ] + ([b.direction_source, b.result_rescue_reason,
+                      "" if b.result_track_id is None else b.result_track_id,
+                      "" if b.result_blob_coverage is None else f"{b.result_blob_coverage:.6f}",
+                      b.segmentation_exclusion,
+                      "" if b.segmentation_source_index is None else b.segmentation_source_index,
+                      int(b.result_source_restored), int(b.result_mask_only), "|".join(b.result_before_reasons)]
+                     if include_result_info else []))
+    return path
+
+
+def draw_text(img: np.ndarray, text: str, x: int, y: int, color: Tuple[int, int, int], scale: float = 0.4) -> None:
+    cv2.putText(img, text, (x, y), cv2.FONT_HERSHEY_SIMPLEX, scale, color, 1, cv2.LINE_AA)
+
+
+def draw_multiline_text(img: np.ndarray, lines: List[str], x: int, y: int, color: Tuple[int, int, int], scale: float = 0.4) -> None:
+    line_step = max(12, int(round(14 * scale / 0.4)))
+    base_y = max(12, y)
+    for i, line in enumerate(lines):
+        draw_text(img, line, x, base_y + i * line_step, color, scale)
+
+
+def contour_axis_length(
+    center: Tuple[float, float],
+    axis: Tuple[float, float],
+    contour: np.ndarray,
+) -> Optional[float]:
+    u = unit_vec(float(axis[0]), float(axis[1]))
+    if u is None:
+        return None
+    pts = np.asarray(contour, dtype=np.float32).reshape(-1, 2)
+    if pts.shape[0] < 3:
+        return None
+    c = np.asarray([float(center[0]), float(center[1])], dtype=np.float32)
+    proj = (pts - c) @ np.asarray(u, dtype=np.float32)
+    if proj.size == 0:
+        return None
+    length = float(np.max(proj) - np.min(proj))
+    if not np.isfinite(length) or length <= 0.0:
+        return None
+    return length
+
+
+def ensure_clockwise(pts: np.ndarray) -> np.ndarray:
+    pts = np.asarray(pts, dtype=np.float32).reshape(4, 2)
+    c = np.mean(pts, axis=0)
+    ang = np.arctan2(pts[:, 1] - c[1], pts[:, 0] - c[0])
+    pts = pts[np.argsort(ang)]
+    area2 = 0.0
+    for i in range(4):
+        x1, y1 = pts[i]
+        x2, y2 = pts[(i + 1) % 4]
+        area2 += x1 * y2 - x2 * y1
+    if area2 > 0:
+        pts = pts[::-1]
+    return pts.astype(np.float32)
+
+
+def obb_center(pts: np.ndarray) -> np.ndarray:
+    return np.mean(np.asarray(pts, dtype=np.float32).reshape(4, 2), axis=0)
+
+
+def get_short_edge_candidates(pts: np.ndarray, rel_tol: float = 0.05) -> List[Tuple[int, int, float]]:
+    pts = ensure_clockwise(pts)
+    edges: List[Tuple[int, int, float]] = []
+    lengths: List[float] = []
+    for i in range(4):
+        j = (i + 1) % 4
+        edge_len = float(np.linalg.norm(pts[j] - pts[i]))
+        edges.append((i, j, edge_len))
+        lengths.append(edge_len)
+    if not lengths:
+        return []
+    min_len = min(lengths)
+    tol = max(1e-6, min_len * float(rel_tol))
+    return [e for e in edges if abs(e[2] - min_len) <= tol]
+
+
+def outward_normal_for_edge(pts: np.ndarray, i: int, j: int) -> np.ndarray:
+    pts = ensure_clockwise(pts)
+    p0 = pts[i]
+    p1 = pts[j]
+    edge = p1 - p0
+    edge_len = float(np.linalg.norm(edge))
+    if edge_len <= 0.0:
+        return np.asarray([0.0, 0.0], dtype=np.float32)
+    normal = np.asarray([edge[1], -edge[0]], dtype=np.float32) / edge_len
+    midpoint = 0.5 * (p0 + p1)
+    center = obb_center(pts)
+    if float(np.dot(midpoint - center, normal)) < 0.0:
+        normal = -normal
+    return normal.astype(np.float32)
+
+
+def draw_heading_triangle_for_obb(
+    img: np.ndarray,
+    pts: np.ndarray,
+    direction_vec: Tuple[float, float],
+    color: Tuple[int, int, int],
+    alpha: float = 0.6,
+    outline_thickness: int = 1,
+    scale: float = 1.2,
+) -> None:
+    pts = ensure_clockwise(pts)
+    u = unit_vec(float(direction_vec[0]), float(direction_vec[1]))
+    if u is None:
+        return
+    short_edges = get_short_edge_candidates(pts)
+    if not short_edges:
+        return
+
+    best = None
+    for i, j, edge_len in short_edges:
+        normal = outward_normal_for_edge(pts, i, j)
+        score = float(np.dot(normal, np.asarray(u, dtype=np.float32)))
+        cand = (score, i, j, edge_len, normal)
+        if best is None or score > best[0]:
+            best = cand
+    if best is None:
+        return
+
+    _, i, j, base_len, normal = best
+    if base_len <= 0.0:
+        return
+    p0 = pts[i].astype(np.float32)
+    p1 = pts[j].astype(np.float32)
+    base_mid = 0.5 * (p0 + p1)
+    height = float(scale) * (math.sqrt(3.0) / 2.0) * float(base_len)
+    apex = base_mid + normal.astype(np.float32) * height
+
+    tri = np.vstack([p0, p1, apex]).astype(np.float32)
+    tri_i32 = np.round(tri).astype(np.int32).reshape(-1, 1, 2)
+
+    a = float(np.clip(alpha, 0.0, 1.0))
+    if a > 0.0:
+        overlay = img.copy()
+        cv2.fillConvexPoly(overlay, tri_i32, color, lineType=cv2.LINE_AA)
+        img[...] = cv2.addWeighted(overlay, a, img, 1.0 - a, 0.0)
+    if int(outline_thickness) > 0:
+        cv2.polylines(img, [tri_i32], True, color, int(outline_thickness), cv2.LINE_AA)
+
+
+_WITHOUT_CROSSING_WORKER = {}
+
+# GPU caches: keyed by (ksize, sigma) for the Gaussian kernel and id(bg_f32) for the background tensor.
+_GPU_GAUSS_CACHE: dict = {}
+_GPU_BG_CACHE: dict = {}
+
+
+def _get_gauss_kernel_gpu(ksize: int, sigma: float):
+    key = (ksize, sigma)
+    if key not in _GPU_GAUSS_CACHE:
+        ax = _torch.arange(ksize, dtype=_torch.float32) - ksize // 2
+        g = _torch.exp(-ax ** 2 / (2.0 * sigma ** 2))
+        k2d = g.outer(g)
+        k2d /= k2d.sum()
+        _GPU_GAUSS_CACHE[key] = k2d.view(1, 1, ksize, ksize).cuda()
+    return _GPU_GAUSS_CACHE[key]
+
+
+def _without_crossing_blend_gpu(
+    frame_bgr: np.ndarray,
+    remove_mask: np.ndarray,
+    bg_f32: np.ndarray,
+    ksize: int,
+    sigma: float,
+) -> np.ndarray:
+    """GPU-accelerated GaussianBlur + alpha blend. Falls back to CPU on any error."""
+    try:
+        keep = (remove_mask == 0).astype(np.float32)
+        keep_t = _torch.from_numpy(keep).cuda().unsqueeze(0).unsqueeze(0)
+        if ksize > 1:
+            keep_t = _F.conv2d(keep_t, _get_gauss_kernel_gpu(ksize, sigma), padding=ksize // 2)
+        alpha_t = keep_t.squeeze().unsqueeze(-1)
+        fr_t = _torch.from_numpy(frame_bgr).float().cuda()
+        bg_key = id(bg_f32)
+        if bg_key not in _GPU_BG_CACHE:
+            _GPU_BG_CACHE[bg_key] = _torch.from_numpy(bg_f32).cuda()
+        bg_t = _GPU_BG_CACHE[bg_key]
+        return (fr_t * alpha_t + bg_t * (1.0 - alpha_t)).clamp(0, 255).byte().cpu().numpy()
+    except Exception:
+        keep = (remove_mask == 0).astype(np.float32)
+        alpha = cv2.GaussianBlur(keep, (ksize, ksize), sigma)[..., None]
+        return (frame_bgr.astype(np.float32) * alpha + bg_f32 * (1.0 - alpha)).astype(np.uint8)
+
+
+def _probe_video_frame_shape(video_path: str) -> Tuple[int, int]:
+    """Return (H, W) by actually decoding the video's first frame.
+
+    Uses the real decoded frame rather than CAP_PROP_FRAME_WIDTH/HEIGHT
+    container metadata, which can disagree with what actually comes out of
+    decode for some files.
+    """
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise RuntimeError(f"Cannot open video: {video_path}")
+    try:
+        ret, frame0 = cap.read()
+        if not ret or frame0 is None or frame0.size == 0:
+            raise RuntimeError(f"Failed to read first frame: {video_path}")
+        return int(frame0.shape[0]), int(frame0.shape[1])
+    finally:
+        cap.release()
+
+
+def _iter_needed_video_frames(video_path: str, needed_frame_ids: Sequence[int]):
+    """Decode exactly the requested frame ids, in ascending order, and nothing else.
+
+    Never seeks: CAP_PROP_POS_FRAMES is not guaranteed frame-exact for
+    inter-frame codecs (H.264/H.265), and a single mis-seek would silently
+    pair a contour from the segmentation pickle with the wrong video frame,
+    shifting the mask by however far the animal moved in that time. Instead
+    this walks the decoder forward from frame 0 with grab() (cheap skip, no
+    color-space conversion) for frames we don't need and read() (full decode)
+    for frames we do, so the frame handed back for a given id is always
+    exactly that frame.
+    """
+    ordered_ids = sorted(int(f) for f in needed_frame_ids)
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise RuntimeError(f"Cannot open video: {video_path}")
+    try:
+        current = 0
+        for fid in ordered_ids:
+            while current < fid:
+                if not cap.grab():
+                    raise RuntimeError(
+                        f"Video ended while advancing to frame {fid} "
+                        f"(stopped at frame {current}): {video_path}"
+                    )
+                current += 1
+            ret, frame = cap.read()
+            if not ret or frame is None or frame.size == 0:
+                raise RuntimeError(f"Failed to read frame {fid} from video: {video_path}")
+            current += 1
+            yield fid, frame
+    finally:
+        cap.release()
+
+
+def _init_without_crossing_writer_worker(
+    cfg: dict,
+    bounds: dict,
+    preview_ids: Sequence[int],
+    frame_shape: Tuple[int, int],
+    use_gpu: bool = False,
+) -> None:
+    """Initialize the output context (no video decoding here).
+
+    Called once in the main thread (serial / ThreadPoolExecutor paths) or once per
+    worker process (ProcessPoolExecutor path). Frames are decoded exactly once,
+    serially, by the caller (_iter_needed_video_frames) and handed to
+    _process_without_crossing_frame directly, so workers never touch a
+    VideoCapture and can never seek.
+    """
+    cv2.setNumThreads(1)
+    session_path = str(cfg["SESSION_PATH"])
+    bg_path = str(cfg["BACKGROUND_PATH"])
+    out_dir = os.path.join(session_path, SINGLE_ANIMAL_IMAGES_DIR_NAME)
+
+    H, W = int(frame_shape[0]), int(frame_shape[1])
+    bg = read_background(bg_path, (H, W))
+
+    edge_blur_ksize = int(cfg.get("EDGE_BLUR_KSIZE", 7))
+    edge_blur_sigma = float(cfg.get("EDGE_BLUR_SIGMA", 11))
+    if edge_blur_ksize < 1:
+        edge_blur_ksize = 1
+    if edge_blur_ksize % 2 == 0:
+        edge_blur_ksize += 1
+    png_compression = min(
+        9,
+        max(0, int(cfg.get("WITHOUT_CROSSING_PNG_COMPRESSION", 1))),
+    )
+
+    _WITHOUT_CROSSING_WORKER.clear()
+    _WITHOUT_CROSSING_WORKER.update({
+        "cfg": cfg,
+        "bounds": bounds,
+        "preview_ids": {int(x) for x in preview_ids},
+        "H": int(H),
+        "W": int(W),
+        "bg_f32": bg.astype(np.float32),
+        "edge_blur_ksize": int(edge_blur_ksize),
+        "edge_blur_sigma": float(edge_blur_sigma),
+        "mask_expansion_ratio": get_mask_expansion_ratio(cfg),
+        "obb_fit_mode": normalize_obb_fit_mode(cfg.get("OBB_FIT_MODE", "min_area")),
+        "use_gpu": bool(use_gpu),
+        "png_write_params": [cv2.IMWRITE_PNG_COMPRESSION, png_compression],
+        "img_dir": os.path.join(out_dir, "images"),
+        "lbl_dir": os.path.join(out_dir, "labels"),
+        "mask_dir": os.path.join(out_dir, "masks"),
+        "prev_dir": os.path.join(out_dir, "preview"),
+        "pool_img_dir": os.path.join(out_dir, "object_pool", "images"),
+        "pool_mask_dir": os.path.join(out_dir, "object_pool", "masks"),
+    })
+
+
+# Paste time re-derives its expansion contour from the rasterized exact mask
+# (see paste_blobs.expand_mask_raster), not from this file's original smooth
+# vector contour, so its cv2.fillPoly/findContours round-trip lands on a
+# slightly different centroid and boundary than expanding the vector contour
+# directly. A few pixels of extra padding absorb that rounding gap instead of
+# relying on both independent computations to agree to the pixel.
+_CROP_PADDING_MARGIN_PX = 3
+
+
+def _extract_masked_blob_crop(
+    frame: np.ndarray,
+    contour: np.ndarray,
+    mask_expansion_ratio: float,
+) -> Tuple[np.ndarray, np.ndarray, Tuple[int, int, int, int]]:
+    """Create an object-pool donor crop, padded out to mask_expansion_ratio.
+
+    The padding is computed in source-frame coordinates (expand the contour
+    from its centroid, then clip to the frame boundary) before cropping, so
+    the crop always has real pixels behind the maximum paste-time mask
+    expansion instead of being clipped by a tight crop. The crop itself is
+    the raw frame ROI (not masked to the object silhouette): interaction_image_synthesis.py's
+    compositing is entirely mask-driven, so leaving real background pixels in
+    the padding ring is what lets an expanded paste mask reveal them. The
+    exported mask is always the exact, unexpanded contour, rasterized in the
+    same padded coordinate frame.
+
+    Returns (crop_bgr, crop_mask_u8, (x, y, w, h)) where (x, y, w, h) is the
+    padded crop's rect in frame coordinates.
+    """
+    frame_h, frame_w = frame.shape[:2]
+    padded_contour = (
+        expand_contour_from_centroid(contour, mask_expansion_ratio)
+        if mask_expansion_ratio > 1.0 + 1e-9
+        else contour
+    )
+    x, y, w, h = cv2.boundingRect(np.asarray(padded_contour, dtype=np.int32))
+    margin = _CROP_PADDING_MARGIN_PX if mask_expansion_ratio > 1.0 + 1e-9 else 0
+    x1 = max(0, x - margin)
+    y1 = max(0, y - margin)
+    x2 = min(frame_w, x + w + margin)
+    y2 = min(frame_h, y + h + margin)
+    if x2 <= x1 or y2 <= y1:
+        return np.empty((0, 0, 3), dtype=frame.dtype), np.empty((0, 0), dtype=np.uint8), (x1, y1, 0, 0)
+
+    crop = frame[y1:y2, x1:x2].copy()
+
+    crop_mask = np.zeros((y2 - y1, x2 - x1), dtype=np.uint8)
+    local_contour = np.asarray(contour, dtype=np.int32).reshape(-1, 2).copy()
+    local_contour[:, 0] -= x1
+    local_contour[:, 1] -= y1
+    cv2.fillPoly(crop_mask, [local_contour], 255)
+    return crop, crop_mask, (x1, y1, x2 - x1, y2 - y1)
+
+
+def _empty_frame_reason_counts(frame_blob_records: Sequence[BlobRecord]) -> Dict[str, int]:
+    counts: Counter[str] = Counter()
+    if not frame_blob_records:
+        counts["no_source_blobs"] += 1
+        return dict(counts)
+    for b in frame_blob_records:
+        if b.class_id is not None and not b.erase_final:
+            continue
+        reasons = list(b.erase_reasons_final)
+        if b.class_id is None and not b.erase_final:
+            append_unique_reason(reasons, "class_unassigned")
+        if not reasons:
+            reasons = ["unknown_removed"]
+        for reason in reasons:
+            counts[str(reason)] += 1
+    return dict(counts)
+
+
+def _process_without_crossing_frame(
+    fid: int, frame: np.ndarray, frame_blob_records: List[BlobRecord],
+) -> Tuple[int, int, int, int, List[dict], Dict[str, int]]:
+    """Write one single_animal_images frame and its per-frame object-pool files.
+
+    `frame` must already be the exact, correctly-decoded video frame for
+    `fid` (see _iter_needed_video_frames) -- this function does no video I/O.
+    """
+    fid = int(fid)
+    ctx = _WITHOUT_CROSSING_WORKER
+    H = int(ctx["H"])
+    W = int(ctx["W"])
+    bounds = ctx["bounds"]
+
+    valid_blobs = [b for b in frame_blob_records if b.class_id is not None and not b.erase_final]
+    if not valid_blobs:
+        return fid, 0, 0, 0, [], _empty_frame_reason_counts(frame_blob_records)
+
+    if frame.shape[:2] != (H, W):
+        # Do not silently resize: contour coordinates are in the video's own
+        # pixel space, so a differently-sized frame means something is
+        # actually wrong, not a harmless size difference to paper over.
+        raise RuntimeError(
+            f"Frame shape mismatch at frame={fid}: got {frame.shape[:2]}, expected {(H, W)}."
+        )
+
+    remove_blobs = [b for b in frame_blob_records if b.erase_final]
+
+    if not remove_blobs:
+        canvas = frame
+    else:
+        remove_mask = np.zeros((H, W), dtype=np.uint8)
+        for b in remove_blobs:
+            cv2.fillPoly(remove_mask, [b.contour.astype(np.int32)], 255)
+
+        ksize = int(ctx["edge_blur_ksize"])
+        sigma = float(ctx["edge_blur_sigma"])
+        if bool(ctx.get("use_gpu", False)):
+            canvas = _without_crossing_blend_gpu(frame, remove_mask, ctx["bg_f32"], ksize, sigma)
+        else:
+            keep = (remove_mask == 0).astype(np.float32)
+            alpha = cv2.GaussianBlur(keep, (ksize, ksize), sigma)[..., None]
+            canvas = (frame.astype(np.float32) * alpha + ctx["bg_f32"] * (1.0 - alpha)).astype(np.uint8)
+
+    protected_blobs = [b for b in valid_blobs if b.result_protected]
+    if protected_blobs and remove_blobs:
+        protected_mask = np.zeros((H, W), dtype=np.uint8)
+        for b in protected_blobs:
+            cv2.fillPoly(protected_mask, [b.contour.astype(np.int32)], 255)
+        canvas = canvas.copy()
+        canvas[protected_mask > 0] = frame[protected_mask > 0]
+
+    label_lines: List[str] = []
+    mask_lines: List[str] = []
+    manifest_rows: List[dict] = []
+    accepted_count = 0
+
+    for out_idx, b in enumerate(valid_blobs):
+        class_name = DIRECTION_CLASS_NAMES[b.class_id]
+        obb_pts = contour_to_obb_points(b.contour, obb_fit_mode=ctx["obb_fit_mode"])
+        label_lines.append(yolo_line_from_obb_points(b.class_id, obb_pts, W, H))
+        mask_lines.append(
+            polygon_line_from_contour(
+                b.contour,
+                class_id=b.class_id,
+                class_name=class_name,
+                occlusion_state=0,
+                is_pasted=0,
+                overlap_pixels=0,
+                overlap_ratio=0.0,
+            )
+        )
+
+        crop, crop_mask, (x, y, w, h) = _extract_masked_blob_crop(
+            frame, b.contour, ctx["mask_expansion_ratio"],
+        )
+        pool_id = f"f{fid:06d}_b{out_idx:03d}"
+        crop_name = pool_id + ".png"
+        mask_name = pool_id + "_mask.png"
+        write_png(os.path.join(ctx["pool_img_dir"], crop_name), crop, params=ctx["png_write_params"])
+        write_png(os.path.join(ctx["pool_mask_dir"], mask_name), crop_mask, params=ctx["png_write_params"])
+        if b.direction_vec is None:
+            raise ValueError(f"Accepted blob has no direction_vec: frame={fid}, blob_index={b.blob_index}")
+        direction_norm = math.hypot(float(b.direction_vec[0]), float(b.direction_vec[1]))
+        if not np.isfinite(direction_norm) or not math.isclose(direction_norm, 1.0, rel_tol=1e-3, abs_tol=1e-3):
+            raise ValueError(
+                f"Accepted blob direction_vec is not unit length: "
+                f"frame={fid}, blob_index={b.blob_index}, norm={direction_norm}"
+            )
+        if b.axis_length is None or not np.isfinite(float(b.axis_length)) or float(b.axis_length) <= 0.0:
+            raise ValueError(f"Accepted blob has invalid axis_length: frame={fid}, blob_index={b.blob_index}")
+        manifest_rows.append({
+            "pool_id": pool_id,
+            "frame": fid,
+            "blob_index": b.blob_index,
+            "traj_id": -1 if b.traj_id is None else b.traj_id,
+            "direction_valid": 1,
+            "class_id": b.class_id,
+            "class_name": class_name,
+            "head_angle_deg": f"{head_angle_deg_from_axis(b.direction_vec):.6f}",
+            "direction_dx": f"{b.direction_vec[0]:.6f}",
+            "direction_dy": f"{b.direction_vec[1]:.6f}",
+            "center_x": f"{float(b.center[0]):.6f}",
+            "center_y": f"{float(b.center[1]):.6f}",
+            "axis_length": f"{float(b.axis_length):.6f}",
+            "obb_aspect_ratio": "" if b.obb_aspect_ratio is None else f"{float(b.obb_aspect_ratio):.6f}",
+            "min_obb_aspect_ratio": f"{float(bounds['min_obb_aspect_ratio']):.6f}",
+            "rect_x": x,
+            "rect_y": y,
+            "rect_w": w,
+            "rect_h": h,
+            "occlusion_state": 0,
+            "crop_image": os.path.join("object_pool", "images", crop_name),
+            "crop_mask": os.path.join("object_pool", "masks", mask_name),
+            "is_pasted": 0,
+            "overlap_pixels": 0,
+            "overlap_ratio": 0.0,
+        })
+        accepted_count += 1
+
+    img_name = f"frame_{fid:06d}.png"
+    write_png(os.path.join(ctx["img_dir"], img_name), canvas, params=ctx["png_write_params"])
+
+    with open(os.path.join(ctx["lbl_dir"], img_name.replace(".png", ".txt")), "w", encoding="utf-8") as f:
+        f.writelines(label_lines)
+    with open(os.path.join(ctx["mask_dir"], img_name.replace(".png", "_maskinfo.txt")), "w", encoding="utf-8") as f:
+        f.writelines(mask_lines)
+
+    saved_preview_count = 0
+    if fid in ctx["preview_ids"]:
+        preview = canvas.copy()
+        preview_removed = [b for b in remove_blobs if b.contour.reshape(-1, 2).shape[0] >= 3]
+        result_rescued = any(b.direction_source == "result" for b in valid_blobs)
+        if result_rescued:
+            rescued_fragments = {index for b in valid_blobs if b.direction_source == "result"
+                                 for index in b.source_fragment_indices}
+            for b in preview_removed:
+                if b.blob_index in rescued_fragments:
+                    continue
+                draw_obb(preview, contour_to_obb_points(b.contour, obb_fit_mode=ctx["obb_fit_mode"]), OUTLIER_COLOR, 2)
+        for b in valid_blobs:
+            obb_pts = contour_to_obb_points(b.contour, obb_fit_mode=ctx["obb_fit_mode"])
+            draw_obb(preview, obb_pts, OBB_COLOR, 2)
+            if b.direction_vec is not None:
+                draw_heading_triangle_for_obb(
+                    preview,
+                    obb_pts,
+                    b.direction_vec,
+                    OBB_COLOR,
+                    alpha=0.6,
+                    outline_thickness=1,
+                    scale=1.2,
+                )
+        if not result_rescued:
+            for b in preview_removed:
+                draw_obb(preview, contour_to_obb_points(b.contour, obb_fit_mode=ctx["obb_fit_mode"]), OUTLIER_COLOR, 2)
+        write_png(os.path.join(ctx["prev_dir"], img_name), preview, params=ctx["png_write_params"])
+        saved_preview_count = 1
+
+    return fid, accepted_count, 1, saved_preview_count, manifest_rows, {}
+
+
+def _resolve_without_crossing_writer_workers(cfg: dict) -> int:
+    from batch_utils import auto_num_workers as _auto
+    workers_cfg = resolve_num_workers(cfg, "create_single_animals_images", default=None)
+    if workers_cfg is not None:
+        return max(1, int(workers_cfg))
+    return _auto("process")
+
+
+def _resolve_without_crossing_writer_gpu(cfg: dict) -> bool:
+    """Use CPU processes by default; enable CUDA only through an explicit opt-in."""
+    requested = str(cfg.get("WITHOUT_CROSSING_WRITER_DEVICE", "cpu")).strip().lower()
+    if requested not in {"gpu", "cuda"}:
+        return False
+    if not _load_cuda_backend():
+        print("[WARN] WITHOUT_CROSSING_WRITER_DEVICE requests CUDA, but CUDA is unavailable; using CPU.")
+        return False
+    return True
+
+
+def save_without_crossing_dataset(
+    blob_records: Dict[int, List[BlobRecord]],
+    cfg: dict,
+    output_frame_indices: Sequence[int],
+    bounds: Dict[str, Tuple[float, float]],
+) -> Dict[str, int]:
+    session_path = str(cfg["SESSION_PATH"])
+    out_dir = os.path.join(session_path, SINGLE_ANIMAL_IMAGES_DIR_NAME)
+    img_dir = os.path.join(out_dir, "images")
+    lbl_dir = os.path.join(out_dir, "labels")
+    mask_dir = os.path.join(out_dir, "masks")
+    prev_dir = os.path.join(out_dir, "preview")
+    pool_img_dir = os.path.join(out_dir, "object_pool", "images")
+    pool_mask_dir = os.path.join(out_dir, "object_pool", "masks")
+    ensure_dirs([img_dir, lbl_dir, mask_dir, prev_dir, pool_img_dir, pool_mask_dir])
+
+    frame_tasks: List[Tuple[int, List[BlobRecord]]] = []
+    for fid in output_frame_indices:
+        fid_int = int(fid)
+        if fid_int not in blob_records:
+            continue
+        frame_tasks.append((fid_int, list(blob_records[fid_int])))
+
+    # Preview frames are sampled evenly across all available output frames,
+    # with a single global cap shared by the Easy Tracking preview folders.
+    preview_ids = evenly_sample_frame_ids(
+        (fid for fid, _ in frame_tasks),
+        max(0, int(cfg.get("NUM_PREVIEW_FRAMES", 20))),
+    )
+
+    workers = _resolve_without_crossing_writer_workers(cfg)
+    use_gpu = _resolve_without_crossing_writer_gpu(cfg)
+    if len(frame_tasks) <= 1:
+        workers = 1
+    else:
+        workers = min(int(workers), len(frame_tasks))
+
+    results: List[Tuple[int, int, int, int, List[dict], Dict[str, int]]] = []
+    accel = "GPU" if use_gpu else "CPU"
+
+    # Frames with no accepted blob never need decoding (they are cheaply
+    # grab()-skipped by _iter_needed_video_frames); split them out up front so
+    # only frames that actually produce an output image go through a full
+    # video decode.
+    decode_tasks: Dict[int, List[BlobRecord]] = {}
+    for fid, frame_blob_records in frame_tasks:
+        valid_blobs = [b for b in frame_blob_records if b.class_id is not None and not b.erase_final]
+        if not valid_blobs:
+            results.append((fid, 0, 0, 0, [], _empty_frame_reason_counts(frame_blob_records)))
+        else:
+            decode_tasks[fid] = frame_blob_records
+    needed_ids = sorted(decode_tasks.keys())
+
+    if needed_ids:
+        video_path = resolve_reference_video_path(cfg)
+        frame_shape = _probe_video_frame_shape(video_path)
+        desc = "Writing single_animal_images segments" + (f" x{workers}" if workers > 1 else "") + f" ({accel})"
+
+        if workers <= 1:
+            # Serial path: single VideoCapture, decoded strictly in order.
+            _init_without_crossing_writer_worker(cfg, bounds, preview_ids, frame_shape, use_gpu)
+            try:
+                for fid, frame in tqdm(
+                    _iter_needed_video_frames(video_path, needed_ids),
+                    total=len(needed_ids),
+                    desc=desc,
+                ):
+                    results.append(_process_without_crossing_frame(fid, frame, decode_tasks[fid]))
+            finally:
+                _WITHOUT_CROSSING_WORKER.clear()
+                _GPU_BG_CACHE.clear()
+        else:
+            # Decoding is strictly serial and seek-free (see
+            # _iter_needed_video_frames), which guarantees each frame handed
+            # to a worker is really the frame its pickle contour was computed
+            # from. Frames are pulled off that single decode stream and
+            # dispatched in bounded batches, so parallelism is kept for
+            # background substitution / PNG writing without ever holding more
+            # than a couple batches' worth of full-resolution frames in memory.
+            batch_size = max(1, workers * 2)
+            frame_iter = _iter_needed_video_frames(video_path, needed_ids)
+            if use_gpu:
+                # GPU path: threads share process memory, so the frame handed
+                # to a worker is the exact array this loop decoded.
+                _init_without_crossing_writer_worker(cfg, bounds, preview_ids, frame_shape, True)
+                executor_cm = ThreadPoolExecutor(max_workers=workers)
+            else:
+                # CPU path: each worker process only ever receives frames
+                # already decoded by the main process; it never opens the
+                # video itself.
+                executor_cm = ProcessPoolExecutor(
+                    max_workers=workers,
+                    initializer=_init_without_crossing_writer_worker,
+                    initargs=(cfg, bounds, preview_ids, frame_shape, False),
+                )
+            try:
+                with executor_cm as ex, tqdm(total=len(needed_ids), desc=desc) as pbar:
+                    while True:
+                        batch = list(itertools.islice(frame_iter, batch_size))
+                        if not batch:
+                            break
+                        futures = {
+                            ex.submit(_process_without_crossing_frame, fid, frame, decode_tasks[fid]): fid
+                            for fid, frame in batch
+                        }
+                        for fut in as_completed(futures):
+                            results.append(fut.result())
+                            pbar.update(1)
+            finally:
+                if use_gpu:
+                    _WITHOUT_CROSSING_WORKER.clear()
+                    _GPU_BG_CACHE.clear()
+
+    results.sort(key=lambda x: int(x[0]))
+
+    manifest_rows: List[dict] = []
+    accepted_count = 0
+    saved_image_count = 0
+    saved_preview_count = 0
+    skipped_empty_frames = 0
+    empty_frame_reason_counts: Counter[str] = Counter()
+    for _, accepted, saved_image, saved_preview, rows, reason_counts in results:
+        accepted_count += int(accepted)
+        saved_image_count += int(saved_image)
+        saved_preview_count += int(saved_preview)
+        manifest_rows.extend(rows)
+        if int(saved_image) == 0:
+            skipped_empty_frames += 1
+            empty_frame_reason_counts.update({str(k): int(v) for k, v in reason_counts.items()})
+
+    manifest_path = os.path.join(out_dir, "object_pool", "manifest.csv")
+    with open(manifest_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=[
+                "pool_id", "frame", "blob_index", "traj_id", "direction_valid", "class_id", "class_name",
+                "head_angle_deg", "direction_dx", "direction_dy",
+                "center_x", "center_y", "axis_length",
+                "obb_aspect_ratio", "min_obb_aspect_ratio",
+                "rect_x", "rect_y", "rect_w", "rect_h",
+                "crop_image", "crop_mask",
+                "occlusion_state", "is_pasted", "overlap_pixels", "overlap_ratio",
+            ],
+        )
+        writer.writeheader()
+        writer.writerows(manifest_rows)
+
+    names_path = os.path.join(out_dir, "class_names.txt")
+    with open(names_path, "w", encoding="utf-8") as f:
+        for name in DIRECTION_CLASS_NAMES:
+            f.write(name + "\n")
+
+    print(f"single_animal_images writer workers: {workers}")
+
+    return {
+        "accepted_objects": accepted_count,
+        "object_pool_rows": len(manifest_rows),
+        "saved_images": saved_image_count,
+        "saved_previews": saved_preview_count,
+        "skipped_empty_frames": skipped_empty_frames,
+        "empty_frame_removed_blobs": sum(empty_frame_reason_counts.values()),
+        "empty_frame_reason_counts": dict(sorted(empty_frame_reason_counts.items())),
+    }
+
+
+def save_keypoints_csv(blob_records: Dict[int, List[BlobRecord]], out_dir: str) -> str:
+    """Write the head / center / tail landmarks of every accepted blob.
+
+    This is the side-car that carries the exact body landmarks from the
+    segmentation stage to the behaviour stage. The OBB pipeline keeps
+    working without it; the keypoint pipeline and the behaviour analysis
+    read it.
+    """
+    path = os.path.join(out_dir, "keypoints.csv")
+    fieldnames = [
+        "frame", "blob_index", "traj_id", "class_id", "accepted",
+        "head_x", "head_y", "center_x", "center_y", "tail_x", "tail_y",
+        "heading_deg", "body_length", "head_asymmetry", "confidence",
+        "erase_reasons",
+    ]
+    with open(path, "w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        for frame in sorted(blob_records):
+            for blob in blob_records[frame]:
+                keypoints = blob.keypoints
+                if keypoints is None:
+                    continue
+                row = {
+                    "frame": int(frame),
+                    "blob_index": int(blob.blob_index),
+                    "traj_id": "" if blob.traj_id is None else int(blob.traj_id),
+                    "class_id": "" if blob.class_id is None else int(blob.class_id),
+                    "accepted": 0 if blob.erase_final else 1,
+                    "erase_reasons": ";".join(blob.erase_reasons_final),
+                }
+                row.update(keypoints.as_dict())
+                writer.writerow(row)
+    return path
+
+
+def save_individual_distance_csv(out_dir: str, bounds: Dict[str, Tuple[float, float]], cfg: dict) -> str:
+    path = os.path.join(out_dir, "individual_distance.csv")
+    rows = [
+        ("individual_distance_px", float(bounds.get("individual_distance_px", 0.0))),
+        ("individual_distance_source_count", int(bounds.get("individual_distance_source_count", 0))),
+        ("individual_distance_source_total_non_crossing", int(bounds.get("individual_distance_source_total_non_crossing", 0))),
+        ("obb_major_axis_lo", float(bounds.get("obb_major_axis_bounds", (0.0, 0.0))[0])),
+        ("obb_major_axis_hi", float(bounds.get("obb_major_axis_bounds", (0.0, 0.0))[1])),
+        ("min_obb_aspect_ratio", float(bounds["min_obb_aspect_ratio"])),
+        ("jump_threshold_px", float(bounds.get("jump_threshold_px", 0.0))),
+        ("jump_ratio_to_individual_distance", get_individual_distance_jump_ratio(cfg)),
+        ("source_fps", float(bounds.get("source_fps", (0.0, 0.0))[0])),
+        ("direction_min_valid_frames", int(bounds.get("direction_min_valid_frames", (0, 0))[0])),
+        ("direction_min_valid_frames_fps_ratio", float(bounds.get("direction_min_valid_frames_fps_ratio", (0.0, 0.0))[0])),
+        ("init_max_dist_px", float(bounds.get("init_max_dist_px", 0.0))),
+        ("init_max_dist_ratio", get_init_max_dist_ratio(cfg)),
+        ("traj_max_dist_px", float(bounds.get("traj_max_dist_px", 0.0))),
+        ("traj_max_dist_ratio", get_traj_max_dist_ratio(cfg)),
+        ("direction_min_total_disp_px", float(bounds.get("direction_min_total_disp_px", (0.0, 0.0))[0])),
+        ("direction_min_total_disp_ratio", get_individual_distance_disp_ratio(cfg)),
+    ]
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["metric", "value"])
+        for metric, value in rows:
+            writer.writerow([metric, numeric_or_text(value)])
+    return path
+
+
+def collect_kept_bbox_rows(blob_records: Dict[int, List[BlobRecord]]) -> List[Dict[str, float]]:
+    rows: List[Dict[str, float]] = []
+    for fid in sorted(blob_records.keys()):
+        for b in blob_records[fid]:
+            if b.erase_final:
+                continue
+            rows.append({
+                "frame": int(b.frame),
+                "bbox_index": int(b.blob_index),
+                "w": float(b.w),
+                "h": float(b.h),
+                "sum": float(b.w + b.h),
+                "area": float(b.w * b.h),
+            })
+    return rows
+
+
+def find_source_bbox_row(rows: List[Dict[str, float]], metric: str, kind: str) -> Optional[Dict[str, float]]:
+    if not rows or metric not in {"w", "h", "sum", "area"}:
+        return None
+    reverse = str(kind).lower().strip() == "max"
+    return sorted(
+        rows,
+        key=lambda r: (float(r[metric]), int(r["frame"]), int(r["bbox_index"])),
+        reverse=reverse,
+    )[0]
+
+
+def numeric_or_text(v) -> str:
+    if isinstance(v, (int, np.integer)):
+        return str(int(v))
+    if isinstance(v, (float, np.floating)):
+        if float(v).is_integer():
+            return str(int(v))
+        return f"{float(v):.6f}"
+    return str(v)
+
+
+def save_stats(blob_records: Dict[int, List[BlobRecord]], pre_direction_stats: Dict[str, int], direction_stats: Dict[str, int], save_stats_dict: Dict[str, int], cfg: dict, out_dir: str, bounds: Dict[str, Tuple[float, float]]) -> str:
+    stats_path = os.path.join(out_dir, "bbox_stats_single_animal_images.csv")
+    total_blob_count = sum(len(lst) for lst in blob_records.values())
+    stage1_erased = sum(1 for lst in blob_records.values() for b in lst if b.erase_stage1)
+    pre_direction_erased = sum(1 for lst in blob_records.values() for b in lst if b.erase_pre_direction)
+    final_erased = sum(1 for lst in blob_records.values() for b in lst if b.erase_final)
+    final_kept = total_blob_count - final_erased
+    low_obb_aspect_erased = sum(1 for lst in blob_records.values() for b in lst if b.low_obb_aspect_outlier)
+    kept_rows = collect_kept_bbox_rows(blob_records)
+
+    summary_rows: List[List[object]] = []
+
+    def add_metric(metric: str, kind: str, value_px, frame="", bbox_index="", w="", h="") -> None:
+        summary_rows.append([metric, kind, numeric_or_text(value_px), frame, bbox_index, w, h])
+
+    def add_metric_with_source(metric: str, kind: str, value_px) -> None:
+        src = find_source_bbox_row(kept_rows, metric, kind)
+        if src is None:
+            add_metric(metric, kind, value_px)
+            return
+        add_metric(
+            metric,
+            kind,
+            value_px,
+            int(src["frame"]),
+            int(src["bbox_index"]),
+            numeric_or_text(src["w"]),
+            numeric_or_text(src["h"]),
+        )
+
+    meta_items = [
+        ("n_total_boxes", "meta", total_blob_count),
+        ("frame_interval", "meta", int(cfg.get("FRAME_INTERVAL", 1))),
+        ("first_frame", "meta", int((cfg.get("training", {}) or {}).get("FIRST_FRAME", 0))),
+        ("last_frame_effective", "meta", max((int(fid) for fid in blob_records.keys()), default=-1)),
+        ("crossing_mode", "meta", "segmentation_pickle"),
+        ("source_fps", "meta", float(bounds.get("source_fps", (0.0, 0.0))[0])),
+        ("direction_min_valid_frames", "meta", int(bounds.get("direction_min_valid_frames", (0, 0))[0])),
+        ("direction_min_valid_frames_fps_ratio", "meta", float(bounds.get("direction_min_valid_frames_fps_ratio", (0.0, 0.0))[0])),
+        ("individual_distance_px", "meta", float(bounds.get("individual_distance_px", 0.0))),
+        ("individual_distance_source_count", "meta", int(bounds.get("individual_distance_source_count", 0))),
+        ("direction_min_total_disp_px", "meta", float(cfg.get("_derived_direction_min_total_disp_px", 0.0))),
+        ("min_obb_aspect_ratio", "meta", float(bounds["min_obb_aspect_ratio"])),
+        ("jump_threshold_px", "meta", float(cfg.get("_derived_jump_threshold_px", 0.0))),
+        ("init_max_dist_px", "meta", float(cfg.get("_derived_init_max_dist_px", 0.0))),
+        ("traj_max_dist_px", "meta", float(cfg.get("_derived_traj_max_dist_px", 0.0))),
+        ("jump_ratio_to_individual_distance", "meta", get_individual_distance_jump_ratio(cfg)),
+        ("init_max_dist_ratio", "meta", get_init_max_dist_ratio(cfg)),
+        ("traj_max_dist_ratio", "meta", get_traj_max_dist_ratio(cfg)),
+        ("direction_min_total_disp_ratio", "meta", get_individual_distance_disp_ratio(cfg)),
+        ("stage1_erased_blobs", "meta", stage1_erased),
+        ("low_obb_aspect_erased_blobs", "meta", low_obb_aspect_erased),
+        ("pre_direction_erased_blobs", "meta", pre_direction_erased),
+        ("final_erased_blobs", "meta", final_erased),
+        ("final_kept_blobs", "meta", final_kept),
+        ("pre_direction_unmatched", "meta", pre_direction_stats["pre_direction_unmatched"]),
+        ("pre_direction_short_run", "meta", pre_direction_stats["pre_direction_short_run"]),
+        ("pre_direction_kept", "meta", pre_direction_stats["pre_direction_kept"]),
+        ("direction_input_blobs", "meta", direction_stats["direction_input_blobs"]),
+        ("valid_segments", "meta", direction_stats["valid_segments"]),
+        ("direction_assigned_blobs", "meta", direction_stats["direction_assigned_blobs"]),
+        ("accepted_objects", "meta", save_stats_dict["accepted_objects"]),
+        ("object_pool_rows", "meta", save_stats_dict["object_pool_rows"]),
+        ("saved_images", "meta", save_stats_dict["saved_images"]),
+        ("saved_previews", "meta", save_stats_dict["saved_previews"]),
+        ("skipped_empty_frames", "meta", int(save_stats_dict.get("skipped_empty_frames", 0))),
+        ("empty_frame_removed_blobs", "meta", int(save_stats_dict.get("empty_frame_removed_blobs", 0))),
+        ("direction_classes", "meta", len(DIRECTION_CLASS_NAMES)),
+        ("output_frame_interval", "meta", int(cfg.get("FRAME_INTERVAL", 1))),
+        ("direction_frame_interval", "meta", 1),
+    ]
+    for metric, kind, value in meta_items:
+        add_metric(metric, kind, value)
+    for metric, value in direction_stats.items():
+        if metric.startswith("result_rescue") or metric in {"trajectory_accepted_blobs", "result_rescued_blobs"}:
+            add_metric(metric, "meta", value)
+
+    for reason, count in sorted((save_stats_dict.get("empty_frame_reason_counts") or {}).items()):
+        add_metric(f"empty_frame_reason:{reason}", "removed_blob_count", int(count))
+
+    if kept_rows:
+        for metric in ("w", "h", "sum", "area"):
+            arr = np.asarray([float(r[metric]) for r in kept_rows], dtype=np.float64)
+            add_metric_with_source(metric, "min", float(np.min(arr)))
+            add_metric_with_source(metric, "max", float(np.max(arr)))
+            add_metric(metric, "q1", float(np.percentile(arr, 25)))
+            add_metric(metric, "q3", float(np.percentile(arr, 75)))
+            add_metric(metric, "median", float(np.median(arr)))
+            add_metric(metric, "mean", float(np.mean(arr)))
+    else:
+        for metric in ("w", "h", "sum", "area"):
+            add_metric(metric, "min", "")
+            add_metric(metric, "max", "")
+            add_metric(metric, "q1", "")
+            add_metric(metric, "q3", "")
+            add_metric(metric, "median", "")
+            add_metric(metric, "mean", "")
+
+    jump_rows = [
+        {"frame": int(b.frame), "bbox_index": int(b.blob_index), "jump": float(b.jump_distance_px)}
+        for fid in sorted(blob_records.keys())
+        for b in blob_records[fid]
+        if b.jump_distance_px is not None
+    ]
+    if jump_rows:
+        jump_arr = np.asarray([float(r["jump"]) for r in jump_rows], dtype=np.float64)
+        jump_min_row = min(jump_rows, key=lambda r: (float(r["jump"]), int(r["frame"]), int(r["bbox_index"])))
+        jump_max_row = max(jump_rows, key=lambda r: (float(r["jump"]), -int(r["frame"]), -int(r["bbox_index"])))
+        add_metric("jump", "min", float(np.min(jump_arr)), jump_min_row["frame"], jump_min_row["bbox_index"], "", "")
+        add_metric("jump", "max", float(np.max(jump_arr)), jump_max_row["frame"], jump_max_row["bbox_index"], "", "")
+        add_metric("jump", "q1", float(np.percentile(jump_arr, 25)))
+        add_metric("jump", "q3", float(np.percentile(jump_arr, 75)))
+        add_metric("jump", "median", float(np.median(jump_arr)))
+        add_metric("jump", "mean", float(np.mean(jump_arr)))
+    else:
+        for kind in ("min", "max", "q1", "q3", "median", "mean"):
+            add_metric("jump", kind, "")
+
+    with open(stats_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["metric", "kind", "value_px", "frame", "bbox_index", "w", "h"])
+        writer.writerows(summary_rows)
+        for r in kept_rows:
+            writer.writerow([
+                "bbox",
+                "kept",
+                numeric_or_text(r["area"]),
+                int(r["frame"]),
+                int(r["bbox_index"]),
+                numeric_or_text(r["w"]),
+                numeric_or_text(r["h"]),
+            ])
+
+    return stats_path
+
+def _empty_dataset_message(
+    cfg: dict,
+    bounds: Dict[str, Tuple[float, float]],
+    save_stats_dict: Dict[str, int],
+) -> str:
+    """Explain why the stage produced no segment images at all."""
+    reasons = save_stats_dict.get("empty_frame_reason_counts") or {}
+    dominant_reason, dominant_count = "", 0
+    if reasons:
+        dominant_reason, dominant_count = max(reasons.items(), key=lambda item: int(item[1]))
+    threshold_px = float(bounds.get("direction_min_total_disp_px", (0.0, 0.0))[0])
+    ratio = get_individual_distance_disp_ratio(cfg)
+    message = (
+        "No single_animal_images segments were produced, so the direction dataset "
+        "would be empty. "
+        f"The displacement gate is {ratio:.2f} body lengths ({threshold_px:.1f} px). "
+    )
+    if dominant_reason:
+        message += f"The dominant removal reason is {dominant_reason} ({dominant_count} blobs). "
+    else:
+        message += "No blob survived the trajectory filters. "
+    return (
+        message
+        + "Use a longer clip, lower DIR_MIN_DISP in the configuration, or run the "
+        "analysis without direction estimation."
+    )
+
+
+def main() -> None:
+    if len(sys.argv) < 2:
+        raise SystemExit("Usage: python direction_class_assignment.py config.yaml")
+
+    cfg = load_config(sys.argv[1])
+    session_path = str(cfg["SESSION_PATH"])
+    pickle_path = str(cfg["PICKLE_PATH"])
+    initial_tracking_csv_path = os.path.join(
+        session_path, "initial_tracking", "track_assignments.csv"
+    )
+    initial_tracking_stats_path = os.path.join(
+        session_path, "initial_tracking", "tracking_stats.csv"
+    )
+
+    if not os.path.exists(pickle_path):
+        raise FileNotFoundError(pickle_path)
+    if not os.path.exists(initial_tracking_csv_path):
+        raise FileNotFoundError(initial_tracking_csv_path)
+    if not os.path.exists(initial_tracking_stats_path):
+        raise FileNotFoundError(initial_tracking_stats_path)
+
+    with open(pickle_path, "rb") as f:
+        segmentation_data = pickle.load(f)
+    blob_seq = resolve_blob_sequence(segmentation_data)
+    initial_tracking_assignments = load_initial_tracking_csv(initial_tracking_csv_path)
+    initial_tracking_stats = load_tracking_stats_csv(initial_tracking_stats_path)
+
+    training_cfg = cfg.get("training", {}) or {}
+    first_frame = int(training_cfg.get("FIRST_FRAME", 0))
+    last_frame = int(training_cfg.get("LAST_FRAME", -1))
+    output_frame_interval = max(1, int(cfg.get("FRAME_INTERVAL", 1)))
+    direction_frame_interval = 1
+
+    pickle_frame_count = get_num_blob_frames(blob_seq)
+    frame_info = read_frame_info_with_fallback(
+        str(cfg.get("TRAINING_VIDEO_PATH", "")),
+        str(cfg.get("TRACKING_VIDEO_PATH", "")),
+        label="direction class assignment",
+    )
+    warn_if_frame_count_adjusted(frame_info, label="create_single_animals_images training video")
+    max_frames = min(pickle_frame_count, frame_info.usable_frame_count)
+    first_frame, last_frame = clamp_frame_range_to_usable_count(
+        first_frame, last_frame, max_frames,
+    )
+    print(
+        "[create_single_animals_images] frame range: "
+        f"{first_frame}..{last_frame} ({last_frame - first_frame + 1} frames), "
+        f"pickle_frames={pickle_frame_count}, usable_video_frames={frame_info.usable_frame_count}"
+    )
+
+    direction_frame_indices = list(range(first_frame, last_frame + 1, direction_frame_interval))
+    output_frame_indices = list(range(first_frame, last_frame + 1, output_frame_interval))
+    pre_result_path = str(cfg.get("PRE_RESULT_PATH", "") or "").strip()
+    pre_result_by_frame = load_pre_result_csv(pre_result_path, direction_frame_indices) if pre_result_path else None
+
+    out_dir = os.path.join(session_path, SINGLE_ANIMAL_IMAGES_DIR_NAME)
+    refine_delete_map = load_refine_delete_map(session_path, include_applied=bool(pre_result_path))
+    reset_without_crossing_output_dir(out_dir, preserve_applied_deletions=bool(pre_result_path))
+    ensure_dirs([out_dir])
+
+    individual_distance_px = float(get_required_tracking_stat(initial_tracking_stats, "individual_distance_px", float))
+    individual_distance_source_count = int(get_required_tracking_stat(initial_tracking_stats, "individual_distance_source_count", int))
+    individual_distance_source_total_non_crossing = int(get_required_tracking_stat(initial_tracking_stats, "individual_distance_source_total_non_crossing", int))
+    init_max_dist_px = float(get_required_tracking_stat(initial_tracking_stats, "init_max_dist_px", float))
+
+    blob_records = build_blob_records(
+        blob_seq, direction_frame_indices,
+        obb_fit_mode=cfg.get("OBB_FIT_MODE", "min_area"),
+        segmentation_source_blobs=getattr(segmentation_data, "segmentation_source_blobs", None) if pre_result_path else None,
+    )
+    blob_records = filter_records_by_rois(
+        blob_records, cfg.get("ROI_SETS") or [], (frame_info.height, frame_info.width),
+    )
+    min_valid_frames, min_valid_ratio, source_fps = resolve_direction_min_valid_frames(cfg)
+    cfg["_derived_source_fps"] = float(source_fps)
+    cfg["_derived_direction_min_valid_frames"] = int(min_valid_frames)
+    cfg["_derived_direction_min_valid_frames_fps_ratio"] = float(min_valid_ratio)
+    bounds = classify_blobs_stage1(
+        blob_records,
+        cfg,
+        individual_distance_px=individual_distance_px,
+        individual_distance_source_count=individual_distance_source_count,
+        individual_distance_source_total_non_crossing=individual_distance_source_total_non_crossing,
+        init_max_dist_px=init_max_dist_px,
+    )
+
+    assign_track_ids_from_initial_tracking(
+        blob_records=blob_records,
+        assignments=initial_tracking_assignments,
+    )
+    jump_stats = classify_jump_outliers_stage1(blob_records, cfg, float(bounds.get("individual_distance_px", 0.0)))
+    bounds["jump_bounds"] = tuple(jump_stats["jump_bounds"])
+    bounds["jump_threshold_px"] = float(jump_stats["jump_threshold_px"])
+
+    pre_direction_stats = classify_blobs_pre_direction(blob_records, cfg)
+    pre_direction_run_csv_path = save_pre_direction_run_csv(blob_records, out_dir)
+    min_total_disp = _resolve_min_total_disp(
+        blob_records,
+        cfg,
+        individual_distance_px,
+        individual_distance_px * get_individual_distance_disp_ratio(cfg),
+    )
+    bounds["direction_min_total_disp_px"] = (float(min_total_disp), float(min_total_disp))
+    direction_stats = estimate_directions(
+        blob_records, cfg, float(bounds.get("individual_distance_px", 0.0)), min_total_disp,
+    )
+    refine_delete_stats = apply_refine_deletions(blob_records, refine_delete_map)
+    if pre_result_by_frame is not None:
+        direction_stats.update(rescue_directions_from_result(
+            blob_records, cfg, pre_result_by_frame, refine_delete_map,
+            image_shape=_probe_video_frame_shape(resolve_reference_video_path(cfg)),
+        ))
+        print(
+            "[PRE_RESULT_PATH] trajectory accepted="
+            f"{direction_stats['trajectory_accepted_blobs']}, result rescued={direction_stats['result_rescued_blobs']}, "
+            f"result rescue failed={direction_stats['result_rescue_failed_blobs']}, "
+            f"final accepted={direction_stats['result_rescue_final_kept_blobs']}"
+        )
+
+    cfg["_derived_jump_threshold_px"] = float(bounds.get("jump_threshold_px", 0.0))
+    cfg["_derived_init_max_dist_px"] = float(bounds.get("init_max_dist_px", 0.0))
+    cfg["_derived_traj_max_dist_px"] = float(bounds.get("traj_max_dist_px", 0.0))
+    cfg["_derived_direction_min_total_disp_px"] = float(bounds.get("direction_min_total_disp_px", (0.0, 0.0))[0])
+    cfg["INIT_MAX_DIST_PX"] = float(bounds.get("init_max_dist_px", 0.0))
+    cfg["TRAJ_MAX_DIST_PX"] = float(bounds.get("traj_max_dist_px", 0.0))
+
+    classification_csv_path = save_blob_classification_csv(blob_records, bounds, out_dir, include_result_info=bool(pre_result_path))
+    keypoints_csv_path = save_keypoints_csv(blob_records, out_dir)
+    individual_distance_csv_path = save_individual_distance_csv(out_dir, bounds, cfg)
+    save_stats_dict = save_without_crossing_dataset(blob_records, cfg, output_frame_indices=output_frame_indices, bounds=bounds)
+    save_stats_dict.update(refine_delete_stats)
+    stats_path = save_stats(blob_records, pre_direction_stats, direction_stats, save_stats_dict, cfg, out_dir, bounds)
+
+    print(f"Saved single_animal_images segments to: {out_dir}")
+    print(f"Skipped empty single_animal_images frames: {int(save_stats_dict.get('skipped_empty_frames', 0))}")
+    for reason, count in sorted((save_stats_dict.get("empty_frame_reason_counts") or {}).items()):
+        print(f"  empty-frame removal reason {reason}: {count}")
+    print(f"Saved blob classification to: {classification_csv_path}")
+    print(f"Saved body keypoints to: {keypoints_csv_path}")
+    print(f"Saved individual distance info to: {individual_distance_csv_path}")
+    print(f"Saved pre-direction runs to: {pre_direction_run_csv_path}")
+    print(f"Saved manifest to: {os.path.join(out_dir, 'object_pool', 'manifest.csv')}")
+    print(f"Saved stats to: {stats_path}")
+
+    if int(save_stats_dict.get("saved_images", 0)) <= 0:
+        message = _empty_dataset_message(cfg, bounds, save_stats_dict)
+        print(f"[direction] ERROR: {message}", flush=True)
+        raise RuntimeError(message)
+
+
+if __name__ == "__main__":
+    main()

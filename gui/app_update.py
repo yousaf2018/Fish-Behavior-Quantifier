@@ -1,0 +1,480 @@
+# Copyright (C) 2026 Yusuke Notomi
+# SPDX-License-Identifier: AGPL-3.0-only
+
+from __future__ import annotations
+
+import os
+import queue
+import re
+import shutil
+import ssl
+import stat
+import subprocess
+import sys
+import tempfile
+import threading
+import tkinter as tk
+import urllib.parse
+import urllib.request
+import zipfile
+
+import certifi
+from pathlib import Path, PurePosixPath
+from tkinter import messagebox
+from typing import Callable
+
+try:
+    from .project_paths import PROJECT_ROOT
+    from .update_support import (
+        acquire_update_lock,
+        release_update_lock,
+        terminate_other_fbq_processes,
+    )
+except ImportError:  # Preserve direct execution with: python gui/gui_home.py
+    from project_paths import PROJECT_ROOT
+    from update_support import (
+        acquire_update_lock,
+        release_update_lock,
+        terminate_other_fbq_processes,
+    )
+
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from tools.project_meta import (  # noqa: E402
+    ARCHIVE_URL_TEMPLATE,
+    RELEASES_URL as LATEST_RELEASE_URL,
+    RELEASE_TAG_PATH as LATEST_RELEASE_TAG_PATH,
+    user_agent,
+)
+
+REQUEST_TIMEOUT_SECONDS = 30
+MAX_ARCHIVE_BYTES = 2 * 1024 * 1024 * 1024
+MAX_UNPACKED_BYTES = 4 * 1024 * 1024 * 1024
+VERSION_PATTERN = re.compile(
+    r"v?(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)\Z", re.IGNORECASE
+)
+
+
+def _version_tuple(value: str) -> tuple[int, int, int]:
+    match = VERSION_PATTERN.fullmatch(value.strip())
+    if not match:
+        raise ValueError(f"Unsupported FBQ version format: {value!r}")
+    return tuple(int(part) for part in match.groups())
+
+
+def _version_label(value: str) -> str:
+    return f"v{value.strip().removeprefix('v').removeprefix('V')}"
+
+
+def _https_context() -> ssl.SSLContext:
+    """Use certifi plus the operating system trust store for HTTPS requests."""
+    context = ssl.create_default_context(cafile=certifi.where())
+    context.load_default_certs()
+    return context
+
+
+def _request(url: str) -> urllib.request.Request:
+    return urllib.request.Request(
+        url,
+        headers={"User-Agent": user_agent("Updater"), "Accept": "application/octet-stream"},
+    )
+
+
+def _fetch_latest_version() -> str:
+    request = urllib.request.Request(
+        LATEST_RELEASE_URL,
+        headers={"User-Agent": user_agent("Updater"), "Accept": "text/html"},
+        method="HEAD",
+    )
+    with urllib.request.urlopen(
+        request,
+        timeout=REQUEST_TIMEOUT_SECONDS,
+        context=_https_context(),
+    ) as response:
+        final_url = response.geturl()
+
+    parsed = urllib.parse.urlparse(final_url)
+    if parsed.scheme != "https" or parsed.netloc.lower() != "github.com":
+        raise ValueError(f"GitHub redirected the latest release to an unexpected URL: {final_url}")
+    if not parsed.path.startswith(LATEST_RELEASE_TAG_PATH):
+        raise ValueError(f"GitHub did not redirect to a release tag: {final_url}")
+
+    tag = urllib.parse.unquote(parsed.path[len(LATEST_RELEASE_TAG_PATH):]).strip("/")
+    if not tag or "/" in tag:
+        raise ValueError(f"GitHub returned an invalid release tag URL: {final_url}")
+    _version_tuple(tag)
+    return tag.removeprefix("v").removeprefix("V")
+
+
+def probe_update_status() -> tuple[str, str, bool]:
+    """Return installed version, latest version and whether an update is available.
+
+    This is intentionally silent so Home can probe in the background without
+    showing an error dialog when the machine is offline.
+    """
+    current_version = (PROJECT_ROOT / "VERSION").read_text(encoding="utf-8").strip()
+    current_tuple = _version_tuple(current_version)
+    latest_version = _fetch_latest_version()
+    return current_version, latest_version, _version_tuple(latest_version) > current_tuple
+
+
+def _download_archive(archive_path: Path, version: str) -> None:
+    tag = _version_label(version)
+    archive_url = ARCHIVE_URL_TEMPLATE.format(tag=tag)
+    with urllib.request.urlopen(
+        _request(archive_url),
+        timeout=REQUEST_TIMEOUT_SECONDS,
+        context=_https_context(),
+    ) as response:
+        content_length = response.headers.get("Content-Length")
+        if content_length and int(content_length) > MAX_ARCHIVE_BYTES:
+            raise ValueError("The FBQ update archive exceeds the 2 GiB safety limit.")
+        total = 0
+        with archive_path.open("wb") as destination:
+            while True:
+                chunk = response.read(1024 * 1024)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > MAX_ARCHIVE_BYTES:
+                    raise ValueError("The FBQ update archive exceeds the 2 GiB safety limit.")
+                destination.write(chunk)
+
+
+def _extract_archive(archive_path: Path, staging_root: Path, expected_version: str) -> None:
+    with zipfile.ZipFile(archive_path) as archive:
+        entries = archive.infolist()
+        roots = {
+            PurePosixPath(entry.filename).parts[0]
+            for entry in entries
+            if PurePosixPath(entry.filename).parts
+        }
+        if len(roots) != 1:
+            raise ValueError("The downloaded archive does not have the expected single project folder.")
+
+        archive_root = next(iter(roots))
+        if PurePosixPath(archive_root).is_absolute():
+            raise ValueError("The update archive contains an absolute file path.")
+        if sum(entry.file_size for entry in entries) > MAX_UNPACKED_BYTES:
+            raise ValueError("The FBQ update archive expands beyond the 4 GiB safety limit.")
+
+        for entry in entries:
+            name = entry.filename
+            if "\\" in name or "\x00" in name:
+                raise ValueError("The update archive contains an invalid file path.")
+            parts = PurePosixPath(name).parts
+            if not parts or parts[0] != archive_root:
+                raise ValueError("The update archive contains a path outside the project folder.")
+            if any(part in ("", ".", "..") or ":" in part for part in parts):
+                raise ValueError("The update archive contains an unsafe file path.")
+            if len(parts) == 1 or entry.is_dir():
+                continue
+            relative_parts = parts[1:]
+            if relative_parts[0] in {".git", ".venv", ".uv", "__pycache__"}:
+                continue
+
+            mode = (entry.external_attr >> 16) & 0xFFFF
+            file_type = stat.S_IFMT(mode)
+            if stat.S_ISLNK(mode) or file_type not in (0, stat.S_IFREG):
+                raise ValueError("The update archive contains a non-regular file.")
+
+            destination = staging_root.joinpath(*relative_parts)
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            with archive.open(entry) as source, destination.open("xb") as target:
+                shutil.copyfileobj(source, target)
+            permissions = mode & 0o777
+            if permissions:
+                destination.chmod(permissions)
+
+    required_files = (
+        "VERSION",
+        "pyproject.toml",
+        "uv.lock",
+        "gui/gui_home.py",
+        "gui/app_update.py",
+        "gui/update_support.py",
+        "tools/project_meta.py",
+        "tools/setup_environment.py",
+        "tools/update_manifest.txt",
+        "tools/update_worker.py",
+    )
+    for required in required_files:
+        if not (staging_root / required).is_file():
+            raise ValueError(f"The update archive is missing {required}.")
+
+    archive_version = (staging_root / "VERSION").read_text(encoding="utf-8").strip()
+    if archive_version != expected_version:
+        raise ValueError(
+            "The GitHub version changed while the update was downloading. "
+            "Please check for updates again."
+        )
+
+
+def _app_python() -> str:
+    if os.name == "nt":
+        candidate = Path(sys.prefix) / "Scripts" / "python.exe"
+    else:
+        candidate = Path(sys.prefix) / "bin" / "python"
+    return str(candidate if candidate.is_file() else Path(sys.executable))
+
+
+def start_update_check(
+    root: tk.Misc,
+    *,
+    on_status: Callable[[str], None],
+    on_update_start: Callable[[], None],
+) -> None:
+    """Check GitHub and, after confirmation, download and launch the updater."""
+    if getattr(root, "_fbq_update_busy", False):
+        return
+    root._fbq_update_busy = True
+
+    def status(text: str) -> None:
+        try:
+            on_status(text)
+        except tk.TclError:
+            pass
+
+    def finish() -> None:
+        try:
+            root._fbq_update_busy = False
+            status("Update")
+        except tk.TclError:
+            pass
+
+    dispatch_queue: queue.Queue[Callable[[], None]] = queue.Queue()
+
+    def schedule(callback: Callable[[], None]) -> None:
+        dispatch_queue.put(callback)
+
+    def poll_dispatch_queue() -> None:
+        while True:
+            try:
+                callback = dispatch_queue.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                callback()
+            except tk.TclError:
+                return
+
+        if getattr(root, "_fbq_update_busy", False):
+            try:
+                root.after(50, poll_dispatch_queue)
+            except tk.TclError:
+                pass
+
+    def stop_other_fbq_processes() -> bool:
+        status("Stopping...")
+        try:
+            _stopped, remaining = terminate_other_fbq_processes(
+                PROJECT_ROOT,
+                current_pid=os.getpid(),
+            )
+        except Exception as exc:
+            messagebox.showerror(
+                "FBQ Update",
+                "Could not stop running FBQ processes. The update was not started.\n\n"
+                f"{exc}",
+                parent=root,
+            )
+            finish()
+            return False
+
+        if not remaining:
+            return True
+
+        shown = "\n".join(f"- {name} (PID {pid})" for pid, name in remaining[:6])
+        if len(remaining) > 6:
+            shown += f"\n- ... and {len(remaining) - 6} more"
+        messagebox.showerror(
+            "FBQ Update",
+            "Some FBQ processes could not be stopped, so the update was cancelled.\n\n"
+            f"Still running:\n{shown}",
+            parent=root,
+        )
+        finish()
+        return False
+
+    try:
+        current_version = (PROJECT_ROOT / "VERSION").read_text(encoding="utf-8").strip()
+        current_tuple = _version_tuple(current_version)
+    except (OSError, UnicodeError, ValueError) as exc:
+        messagebox.showerror("FBQ Update", f"Could not read the installed version.\n\n{exc}", parent=root)
+        finish()
+        return
+
+    status("Checking...")
+
+    def check_worker() -> None:
+        try:
+            latest_version = _fetch_latest_version()
+        except Exception as exc:
+            schedule(lambda error=exc: show_check_error(error))
+            return
+        schedule(lambda: show_update_choice(latest_version))
+
+    def show_check_error(exc: Exception) -> None:
+        try:
+            messagebox.showerror(
+                "FBQ Update",
+                f"Could not check for updates. Please check your internet connection and try again.\n\n{exc}",
+                parent=root,
+            )
+        finally:
+            finish()
+
+    def show_update_choice(latest_version: str) -> None:
+        latest_tuple = _version_tuple(latest_version)
+        if latest_tuple == current_tuple:
+            messagebox.showinfo(
+                "FBQ Update",
+                f"FBQ is up to date. ({_version_label(current_version)})",
+                parent=root,
+            )
+            finish()
+            return
+        if latest_tuple < current_tuple:
+            messagebox.showinfo(
+                "FBQ Update",
+                f"This installation ({_version_label(current_version)}) is newer than the version on GitHub "
+                f"({_version_label(latest_version)}). No update was made.",
+                parent=root,
+            )
+            finish()
+            return
+
+        accepted = messagebox.askyesno(
+            "FBQ Update",
+            "A new version of FBQ is available.\n\n"
+            f"{_version_label(current_version)} → {_version_label(latest_version)}\n\n"
+            "Updating will close all other FBQ windows and stop any active "
+            "tracking, training, segmentation, refinement, batch, or video-processing tasks. "
+            "In-progress work in those processes will be interrupted.\n\n"
+            "Stop all running FBQ processes and update now?",
+            parent=root,
+            default=messagebox.NO,
+        )
+        if not accepted:
+            finish()
+            return
+
+        try:
+            lock_token = acquire_update_lock(PROJECT_ROOT)
+        except Exception as exc:
+            messagebox.showerror(
+                "FBQ Update",
+                f"The update could not be started.\n\n{exc}",
+                parent=root,
+            )
+            finish()
+            return
+
+        if not stop_other_fbq_processes():
+            release_update_lock(PROJECT_ROOT, lock_token)
+            return
+
+        status("Downloading")
+        threading.Thread(
+            target=download_worker,
+            args=(latest_version, lock_token),
+            name="FBQ update download",
+            daemon=True,
+        ).start()
+
+    def download_worker(latest_version: str, lock_token: str) -> None:
+        temporary_root: Path | None = None
+        try:
+            temporary_root = Path(tempfile.mkdtemp(prefix="fbq-update-"))
+            archive_path = temporary_root / f"{_version_label(latest_version)}.zip"
+            staging_root = temporary_root / "source"
+            staging_root.mkdir()
+            _download_archive(archive_path, latest_version)
+            _extract_archive(archive_path, staging_root, latest_version)
+        except Exception as exc:
+            release_update_lock(PROJECT_ROOT, lock_token)
+            if temporary_root is not None:
+                shutil.rmtree(temporary_root, ignore_errors=True)
+            schedule(lambda error=exc: show_download_error(error))
+            return
+
+        schedule(
+            lambda: launch_updater(temporary_root, staging_root, latest_version, lock_token)
+        )
+
+    def show_download_error(exc: Exception) -> None:
+        try:
+            messagebox.showerror(
+                "FBQ Update",
+                f"The update could not be downloaded or verified. FBQ has not been changed.\n\n{exc}",
+                parent=root,
+            )
+        finally:
+            finish()
+
+    def launch_updater(
+        temporary_root: Path,
+        staging_root: Path,
+        latest_version: str,
+        lock_token: str,
+    ) -> None:
+        # The user already approved closing all FBQ processes. Repeat the
+        # stop immediately before launch to cover a process opened while the
+        # update archive was downloading.
+        if not stop_other_fbq_processes():
+            release_update_lock(PROJECT_ROOT, lock_token)
+            shutil.rmtree(temporary_root, ignore_errors=True)
+            return
+
+        log_path = temporary_root / "updater.log"
+        python = _app_python()
+        command = [
+            python,
+            "-m",
+            "tools.update_worker",
+            "--project-root",
+            str(PROJECT_ROOT),
+            "--staging-root",
+            str(staging_root),
+            "--temporary-root",
+            str(temporary_root),
+            "--expected-version",
+            latest_version,
+            "--parent-pid",
+            str(os.getpid()),
+            "--python",
+            python,
+            "--lock-token",
+            lock_token,
+        ]
+        kwargs: dict[str, object] = {"cwd": str(PROJECT_ROOT), "close_fds": True}
+        log_stream = log_path.open("a", encoding="utf-8")
+        kwargs.update({"stdin": subprocess.DEVNULL, "stdout": log_stream, "stderr": subprocess.STDOUT})
+        if os.name == "nt":
+            kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        else:
+            kwargs["start_new_session"] = True
+        try:
+            subprocess.Popen(command, **kwargs)
+        except OSError as exc:
+            if log_stream is not None:
+                log_stream.close()
+            release_update_lock(PROJECT_ROOT, lock_token)
+            messagebox.showerror(
+                "FBQ Update",
+                f"The separate updater could not be started. FBQ has not been changed.\n\n{exc}",
+                parent=root,
+            )
+            shutil.rmtree(temporary_root, ignore_errors=True)
+            finish()
+            return
+        if log_stream is not None:
+            log_stream.close()
+
+        on_update_start()
+
+    # Begin polling from the Tk main thread before background work starts.
+    # Worker threads only enqueue callbacks and never call Tk APIs directly.
+    poll_dispatch_queue()
+    threading.Thread(target=check_worker, name="FBQ update check", daemon=True).start()

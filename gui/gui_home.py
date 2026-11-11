@@ -1,0 +1,885 @@
+# Copyright (C) 2026 Yusuke Notomi
+# SPDX-License-Identifier: AGPL-3.0-only
+
+import math
+import os
+import queue
+from collections import deque
+import subprocess
+import sys
+import threading
+import time
+import tkinter as tk
+import uuid
+import webbrowser
+from tkinter import messagebox
+from pathlib import Path
+from typing import Callable
+from PIL import Image, ImageTk
+
+import customtkinter as ctk
+
+if __package__:
+    from .addon_gui import AddonController
+    from .app_uninstall import UNINSTALL_EXIT_CODE, start_uninstall
+    from .app_update import probe_update_status, start_update_check
+    from .project_paths import PROJECT_ROOT, gui_asset, gui_script
+    from .canvas_file_drop import install_canvas_file_drop
+    from .home_drop_routes import home_drop_args, home_drop_suffixes
+    from .video_input import VIDEO_DROP_SUFFIXES
+    from .splash_ipc import (
+        TOKEN_ENV_VAR,
+        external_closed,
+        external_dismissed,
+        external_started_at,
+        signal_stop,
+    )
+    from .splash_reveal import MAX_DISPLAY_MS, reveal_from_left, reveal_total_ms
+    from .splash_geometry import SPLASH_LOGO_WIDTH_RATIO, configure_splash_window
+    from .window_icon import configure_dpi_scaling, configure_taskbar_identity, install_window_icon, tk_font_spec
+    from .ui_theme import apply_theme
+else:
+    from addon_gui import AddonController
+    from app_uninstall import UNINSTALL_EXIT_CODE, start_uninstall
+    from app_update import probe_update_status, start_update_check
+    from project_paths import PROJECT_ROOT, gui_asset, gui_script
+    from canvas_file_drop import install_canvas_file_drop
+    from home_drop_routes import home_drop_args, home_drop_suffixes
+    from video_input import VIDEO_DROP_SUFFIXES
+    from splash_ipc import (
+        TOKEN_ENV_VAR,
+        external_closed,
+        external_dismissed,
+        external_started_at,
+        signal_stop,
+    )
+    from splash_reveal import MAX_DISPLAY_MS, reveal_from_left, reveal_total_ms
+    from splash_geometry import SPLASH_LOGO_WIDTH_RATIO, configure_splash_window
+    from window_icon import configure_dpi_scaling, configure_taskbar_identity, install_window_icon, tk_font_spec
+    from ui_theme import apply_theme
+
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from tools.project_meta import MANUAL_URL  # noqa: E402
+
+apply_theme()
+
+APP_TITLE = "FBQ"
+
+
+def home_window_title() -> str:
+    """Return the Home window title with the installed FBQ version."""
+    try:
+        version = (PROJECT_ROOT / "VERSION").read_text(encoding="utf-8").strip()
+    except OSError:
+        version = ""
+    if not version:
+        return APP_TITLE
+    version_label = version if version.lower().startswith("v") else f"v{version}"
+    return f"{APP_TITLE} {version_label}"
+
+
+ONLINE_MANUAL_BASE_URL = MANUAL_URL
+DEFAULT_BG = "#0D1216"
+PANEL_BORDER = "#27333A"
+TEXT_COLOR = "#E6EDF3"
+SHADOW_COLOR = "#070B0E"
+ACCENT_BLUE = "#3B82F6"
+ACCENT_RED_ORANGE = "#f22800"
+BLACK_RGB = (0, 0, 0)
+GRADIENT_STEPS = 96
+HOVER_INTERVAL_MS = 16
+CTA_INTERVAL_MS = 50
+CTA_PERIOD_MS = 3000
+CTA_MIN_BRIGHTNESS = 0.4
+CTA_MAX_BRIGHTNESS = 0.9
+HOVER_EASING = 0.24
+FLOW_SPEED = 0.012
+FLOW_RAMP = 0.055
+WINDOW_UNIT = 60
+WINDOW_W = WINDOW_UNIT * 24  # 6 bottom panels x 4 units, keeps each panel's original width
+EASY_PANEL_H = WINDOW_UNIT * 12
+BOTTOM_PANEL_H = WINDOW_UNIT * 3
+WINDOW_H = EASY_PANEL_H + BOTTOM_PANEL_H
+SPLASH_BG = "black"
+SPLASH_CLOSE_TIMEOUT_MS = 1500
+
+
+def python_executable() -> str:
+    if os.name == "nt":
+        candidate = Path(sys.prefix) / "Scripts" / "python.exe"
+    else:
+        candidate = Path(sys.prefix) / "bin" / "python"
+    return str(candidate if candidate.is_file() else Path(sys.executable))
+
+
+def ensure_external_splash() -> tuple[bool, subprocess.Popen | None]:
+    """Use a separate splash process so reveal stays smooth during GUI setup."""
+    if os.environ.get(TOKEN_ENV_VAR):
+        return True, None
+
+    token = uuid.uuid4().hex
+    environment = os.environ.copy()
+    environment[TOKEN_ENV_VAR] = token
+    try:
+        kwargs = {
+            "cwd": str(PROJECT_ROOT),
+            "env": environment,
+        }
+        if os.name == "nt":
+            kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+        process = subprocess.Popen(
+            [
+                python_executable(),
+                "-u",
+                str(gui_script("splash_standalone.py")),
+                token,
+                str(MAX_DISPLAY_MS / 1000),
+            ],
+            **kwargs,
+        )
+    except OSError as exc:
+        print(f"[FBQ] Could not launch external splash: {exc}", flush=True)
+        return False, None
+
+    os.environ[TOKEN_ENV_VAR] = token
+    return True, process
+
+
+def show_splash(root: ctk.CTk, reveal: bool = False) -> tk.Toplevel:
+    """Show a fullscreen black window with the FBQ logo centered on it."""
+    splash = tk.Toplevel(root)
+    splash.configure(bg=SPLASH_BG)
+    screen_w, screen_h = configure_splash_window(splash)
+    splash.attributes("-topmost", True)
+
+    canvas = tk.Canvas(splash, width=screen_w, height=screen_h, bg=SPLASH_BG, highlightthickness=0, bd=0)
+    canvas.pack(fill="both", expand=True)
+    splash.FBQ_SPLASH_CANVAS = canvas
+
+    logo_path = gui_asset("logo_fbq_splash.png")
+    if logo_path.is_file():
+        with Image.open(logo_path) as source:
+            source = source.convert("RGBA")
+            target_w = max(1, round(screen_w * SPLASH_LOGO_WIDTH_RATIO))
+            target_h = max(1, round(source.height * (target_w / source.width)))
+            logo = source.resize((target_w, target_h), Image.LANCZOS)
+        photo = ImageTk.PhotoImage(logo, master=splash)
+        canvas.FBQ_SPLASH_PHOTO = photo  # keep a reference alive
+        cx, cy = screen_w / 2, screen_h / 2
+        canvas.create_image(cx, cy, image=photo)
+        if reveal:
+            w, h = photo.width(), photo.height()
+            reveal_from_left(canvas, cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2, SPLASH_BG)
+    else:
+        canvas.create_text(screen_w / 2, screen_h / 2, text=APP_TITLE, font=tk_font_spec(splash, "Arial", 32, "bold"), fill="white")
+
+    splash.lift()
+    return splash
+
+
+def launch_gui_script(
+    name: str, *script_args: str, capture_errors: bool = False,
+) -> subprocess.Popen:
+    kwargs = {"cwd": str(PROJECT_ROOT)}
+    if os.name == "nt":
+        kwargs["creationflags"] = subprocess.CREATE_NEW_CONSOLE
+    if capture_errors:
+        kwargs.update(stderr=subprocess.PIPE, text=True, errors="replace")
+    return subprocess.Popen(
+        [sys.executable, "-u", str(gui_script(name)), *script_args], **kwargs
+    )
+
+
+def launch_behavior_quantification() -> None:
+    launch_gui_script("gui_behavior_quantification.py")
+
+
+def launch_advanced_tracking() -> None:
+    launch_gui_script("gui_advanced_tracking.py")
+
+
+def launch_refinement() -> None:
+    launch_gui_script("gui_refinement.py")
+
+
+def launch_segmentation() -> None:
+    launch_gui_script("gui_segmentation.py")
+
+
+def launch_multi_config_batch() -> None:
+    launch_gui_script("gui_multi_config_batch.py")
+
+
+def launch_preprocess() -> None:
+    launch_gui_script("gui_preprocess.py")
+
+
+def launch_easy_tracking() -> None:
+    launch_gui_script("gui_easy_tracking.py")
+
+
+def launch_colab() -> None:
+    launch_gui_script("gui_colab.py")
+
+
+def _mix_rgb(start: tuple[int, int, int], end: tuple[int, int, int], amount: float) -> tuple[int, int, int]:
+    amount = max(0.0, min(1.0, amount))
+    return tuple(int(round(s + (e - s) * amount)) for s, e in zip(start, end))
+
+
+def _rgb_to_hex(color: tuple[int, int, int]) -> str:
+    return f"#{color[0]:02x}{color[1]:02x}{color[2]:02x}"
+
+
+def _hex_to_rgb(color: str) -> tuple[int, int, int]:
+    value = color.lstrip("#")
+    return int(value[0:2], 16), int(value[2:4], 16), int(value[4:6], 16)
+
+
+def _gradient_color(position: float, hover_amount: float, flow_amount: float) -> str:
+    flow_position = (position % 2.0)
+    accent_position = (1.0 - abs(flow_position - 1.0)) * flow_amount
+    accent = _mix_rgb(_hex_to_rgb(ACCENT_BLUE), _hex_to_rgb(ACCENT_RED_ORANGE), accent_position)
+    return _rgb_to_hex(_mix_rgb(BLACK_RGB, accent, hover_amount))
+
+
+def make_panel(
+    root: ctk.CTk,
+    parent: tk.Misc,
+    text: str,
+    command: Callable[[], None],
+    *,
+    font_size: int,
+    hover_strength: float = 1.0,
+    prompt_text: str | None = None,
+) -> tk.Canvas:
+    canvas = tk.Canvas(
+        parent,
+        width=1,
+        height=1,
+        bg=DEFAULT_BG,
+        highlightthickness=0,
+        bd=0,
+        cursor="hand2",
+        takefocus=1,
+    )
+    font = tk_font_spec(root, "Arial", font_size, "bold")
+    canvas.FBQ_PANEL_FONT = font
+    shadow = canvas.create_text(0, 0, text=text, fill=SHADOW_COLOR, font=font, anchor="center", justify="center")
+    label = canvas.create_text(0, 0, text=text, fill=TEXT_COLOR, font=font, anchor="center", justify="center")
+    hint = (
+        canvas.create_text(
+            0, 0, text=prompt_text,
+            fill=_rgb_to_hex(_mix_rgb(BLACK_RGB, _hex_to_rgb(TEXT_COLOR), CTA_MAX_BRIGHTNESS)),
+            font=tk_font_spec(root, "Arial", 16), anchor="center", justify="center",
+        )
+        if prompt_text else None
+    )
+    hint_started_at = time.monotonic()
+    state = {"hover": 0.0, "target": 0.0, "phase": 0.0, "flow": 0.0, "job_id": None}
+
+    def draw() -> None:
+        width = max(1, canvas.winfo_width())
+        height = max(1, canvas.winfo_height())
+        hover = float(state["hover"]) * hover_strength
+        flow = float(state["flow"])
+        canvas.delete("background")
+        if hover <= 0.001:
+            canvas.create_rectangle(
+                0,
+                0,
+                width,
+                height,
+                fill=DEFAULT_BG,
+                outline=PANEL_BORDER,
+                width=1,
+                tags="background",
+            )
+        else:
+            for index in range(GRADIENT_STEPS):
+                x0 = round(width * index / GRADIENT_STEPS)
+                x1 = round(width * (index + 1) / GRADIENT_STEPS)
+                position = (index / max(1, GRADIENT_STEPS - 1)) + float(state["phase"])
+                color = _gradient_color(position, hover, flow)
+                canvas.create_rectangle(
+                    x0,
+                    0,
+                    x1,
+                    height,
+                    fill=color,
+                    outline=color,
+                    tags="background",
+                )
+            canvas.create_rectangle(
+                0,
+                0,
+                width,
+                height,
+                outline=PANEL_BORDER,
+                width=1,
+                tags="background",
+            )
+        canvas.tag_lower("background")
+        canvas.coords(shadow, width / 2 + 2, height / 2 + 2)
+        canvas.coords(label, width / 2, height / 2)
+        canvas.itemconfigure(shadow, width=max(1, width - 16))
+        canvas.itemconfigure(label, width=max(1, width - 16))
+        if hint is not None:
+            canvas.coords(hint, width / 2, height * 5 / 6)
+
+    def animate_hint() -> None:
+        if hint is None or not canvas.winfo_exists():
+            return
+        if float(state["target"]) > 0.0:
+            brightness = CTA_MAX_BRIGHTNESS
+        else:
+            phase = (time.monotonic() - hint_started_at) * 2 * math.pi * 1000 / CTA_PERIOD_MS
+            brightness = CTA_MIN_BRIGHTNESS + (
+                (CTA_MAX_BRIGHTNESS - CTA_MIN_BRIGHTNESS) * (1 + math.cos(phase)) / 2
+            )
+        canvas.itemconfigure(
+            hint, fill=_rgb_to_hex(_mix_rgb(BLACK_RGB, _hex_to_rgb(TEXT_COLOR), brightness))
+        )
+        canvas.after(CTA_INTERVAL_MS, animate_hint)
+
+    def animate() -> None:
+        current = float(state["hover"])
+        target = float(state["target"])
+        state["phase"] = (float(state["phase"]) - FLOW_SPEED) % 2.0
+        if abs(target - current) < 0.015 and target <= 0.0:
+            state["hover"] = target
+            state["flow"] = 0.0
+            state["job_id"] = None
+            draw()
+            return
+        if abs(target - current) < 0.015:
+            state["hover"] = target
+        else:
+            state["hover"] = current + (target - current) * HOVER_EASING
+        draw()
+        if target > 0.0:
+            state["flow"] = min(1.0, float(state["flow"]) + FLOW_RAMP)
+        else:
+            state["flow"] = max(0.0, float(state["flow"]) - FLOW_RAMP)
+        state["job_id"] = root.after(HOVER_INTERVAL_MS, animate)
+
+    def animate_to(target: float) -> None:
+        if target > 0.0 and float(state["target"]) <= 0.0:
+            state["flow"] = 0.0
+            state["phase"] = 1.0
+        state["target"] = target
+        if state["job_id"] is None:
+            animate()
+
+    def on_click(_event=None) -> None:
+        command()
+
+    canvas.bind("<Configure>", lambda _event: draw())
+    canvas.bind("<Enter>", lambda _event: animate_to(1.0))
+    canvas.bind("<Leave>", lambda _event: animate_to(0.0))
+    canvas.bind("<Button-1>", on_click)
+    canvas.bind("<Return>", on_click)
+    canvas.bind("<space>", on_click)
+    draw()
+    if hint is not None:
+        canvas.after(CTA_INTERVAL_MS, animate_hint)
+    return canvas
+
+
+def manual_url(language: str) -> str:
+    """Return the canonical online manual URL.
+
+    FBQ ships a single manual inside the repository. ``language`` is accepted
+    for call-site compatibility; the manual is currently English only and
+    future translations are selected by :data:`MANUAL_URL` in
+    ``tools/project_meta.py``.
+    """
+    return ONLINE_MANUAL_BASE_URL
+
+
+def open_manual(language: str) -> None:
+    """Open the language-specific online manual in the default browser."""
+    url = manual_url(language)
+    if not webbrowser.open(url):
+        messagebox.showinfo("Open manual", f"Open this page in your browser:\n{url}")
+
+
+def build_home(root: ctk.CTk) -> tuple[tuple[tk.Canvas, str], ...]:
+    root.grid_rowconfigure(0, weight=1)
+    root.grid_columnconfigure(0, weight=1)
+    core = tk.Frame(root, bg=DEFAULT_BG)
+    core.grid(row=0, column=0, sticky="nsew")
+    core.grid_rowconfigure(0, weight=4, minsize=360)
+    core.grid_rowconfigure(1, weight=1, minsize=90)
+    for col in range(6):
+        core.grid_columnconfigure(col, weight=1, uniform="home", minsize=140)
+    addons = AddonController(root, PROJECT_ROOT)
+    root.FBQ_ADDONS = addons
+
+    easy_panel = make_panel(
+        root,
+        core,
+        "Easy Tracking",
+        launch_easy_tracking,
+        font_size=44,
+        hover_strength=0.9,
+        prompt_text="CLICK TO OPEN",
+    )
+    easy_panel.grid(row=0, column=0, columnspan=6, sticky="nsew")
+    drop_targets = [(easy_panel, "gui_easy_tracking.py")]
+
+    corner_buttons = {
+        "uninstall": {
+            "text": "Uninstall", "hover": False, "shape_id": None, "text_id": None,
+        },
+        "help": {
+            "text": "Help", "hover": False, "shape_id": None, "text_id": None,
+        },
+        "addons": {
+            "text": "Add-ons", "hover": False, "shape_id": None, "text_id": None,
+        },
+        "update": {
+            "text": "Update", "hover": False, "shape_id": None, "text_id": None,
+            "available": False, "pulse_started_at": 0.0, "pulse_job": None,
+        },
+    }
+
+    def corner_bounds(name: str) -> tuple[int, int, int, int]:
+        if name == "uninstall":
+            x0, y0 = 24, 24
+            return x0, y0, x0 + 96, y0 + 30
+        index = {"help": 0, "addons": 1, "update": 2}[name]
+        x1, y0 = easy_panel.winfo_width() - 24, 24 + index * 38
+        x0, y1 = x1 - 96, y0 + 30
+        return x0, y0, x1, y1
+
+    UPDATE_GREEN = "#3B82F6"
+    UPDATE_GREEN_HOVER = "#60A5FA"
+
+    def corner_fill(name: str, state: dict) -> str:
+        if state["hover"]:
+            return UPDATE_GREEN_HOVER if name == "update" else ACCENT_RED_ORANGE
+        if name == "update" and state.get("available", False):
+            started = float(state.get("pulse_started_at", 0.0)) or time.monotonic()
+            # Fade from the background to the accent colour of the dark GUI theme.
+            # Clamp and remap the trough so the button spends several frames at
+            # exactly the background colour rather than merely approaching it.
+            phase = ((time.monotonic() - started) % 2.8) / 2.8
+            raw = 0.5 - 0.5 * math.cos(phase * 2.0 * math.pi)
+            eased = 0.0 if raw <= 0.06 else (raw - 0.06) / 0.94
+            return _rgb_to_hex(
+                _mix_rgb(_hex_to_rgb(DEFAULT_BG), _hex_to_rgb(UPDATE_GREEN), eased)
+            )
+        return "#0D1216"
+
+    def corner_outline(name: str, state: dict) -> str:
+        return "#38454E"
+
+    corner_font = tk_font_spec(root, "Arial", 13)
+    easy_panel.FBQ_CORNER_FONT = corner_font
+
+    def draw_corner_buttons(_event=None) -> None:
+        radius = 8
+        for name, state in corner_buttons.items():
+            x0, y0, x1, y1 = corner_bounds(name)
+            points = [
+                x0 + radius, y0, x1 - radius, y0, x1, y0, x1, y0 + radius,
+                x1, y1 - radius, x1, y1, x1 - radius, y1, x0 + radius, y1,
+                x0, y1, x0, y1 - radius, x0, y0 + radius, x0, y0,
+            ]
+            fill = corner_fill(name, state)
+
+            if state["shape_id"] is None:
+                state["shape_id"] = easy_panel.create_polygon(
+                    points,
+                    smooth=True,
+                    splinesteps=24,
+                    fill=fill,
+                    outline=corner_outline(name, state),
+                    tags=("corner_button", name),
+                )
+                state["text_id"] = easy_panel.create_text(
+                    (x0 + x1) / 2,
+                    (y0 + y1) / 2,
+                    text=state["text"],
+                    fill=TEXT_COLOR,
+                    font=corner_font,
+                    tags=("corner_button", name),
+                )
+                continue
+
+            easy_panel.coords(state["shape_id"], *points)
+            easy_panel.itemconfigure(
+                state["shape_id"],
+                fill=fill,
+                outline=corner_outline(name, state),
+            )
+            easy_panel.coords(state["text_id"], (x0 + x1) / 2, (y0 + y1) / 2)
+
+    def set_corner_hover(name: str, value: bool) -> None:
+        state = corner_buttons[name]
+        if state["hover"] == value:
+            return
+        state["hover"] = value
+        if state["shape_id"] is not None:
+            easy_panel.itemconfigure(
+                state["shape_id"],
+                fill=corner_fill(name, state),
+                outline=corner_outline(name, state),
+            )
+
+    def set_update_caption(text: str) -> None:
+        state = corner_buttons["update"]
+        state["text"] = text
+        if state["text_id"] is not None:
+            easy_panel.itemconfigure(state["text_id"], text=text)
+
+    def pulse_update_button() -> None:
+        state = corner_buttons["update"]
+        state["pulse_job"] = None
+        if not state.get("available", False):
+            if state["shape_id"] is not None and not state["hover"]:
+                easy_panel.itemconfigure(
+                    state["shape_id"], fill="#0D1216", outline="#38454E"
+                )
+            return
+        if state["shape_id"] is not None and not state["hover"]:
+            fill = corner_fill("update", state)
+            easy_panel.itemconfigure(
+                state["shape_id"], fill=fill, outline="#38454E"
+            )
+        # ~30 fps is smooth enough for a subtle button fade without adding
+        # noticeable work to the otherwise static Home window.
+        state["pulse_job"] = root.after(34, pulse_update_button)
+
+    def mark_update_available(latest_version: str) -> None:
+        state = corner_buttons["update"]
+        state["available"] = True
+        state["pulse_started_at"] = time.monotonic()
+        state["text"] = "Update!"
+        if state["text_id"] is not None:
+            easy_panel.itemconfigure(state["text_id"], text=state["text"])
+        if state.get("pulse_job") is None:
+            pulse_update_button()
+        root.title(f"{home_window_title()}  ·  update {latest_version} available")
+
+    update_probe_results = queue.Queue()
+
+    def probe_updates_in_background() -> None:
+        try:
+            _current, latest, available = probe_update_status()
+        except Exception:
+            update_probe_results.put((None, False))
+            return
+        update_probe_results.put((latest, available))
+
+    def poll_update_probe() -> None:
+        try:
+            latest, available = update_probe_results.get_nowait()
+        except queue.Empty:
+            try:
+                root.after(50, poll_update_probe)
+            except tk.TclError:
+                pass
+            return
+        if available and latest is not None:
+            mark_update_available(latest)
+
+    def corner_motion(event) -> None:
+        for name in corner_buttons:
+            x0, y0, x1, y1 = corner_bounds(name)
+            set_corner_hover(name, x0 <= event.x <= x1 and y0 <= event.y <= y1)
+
+    def corner_leave(_event=None) -> None:
+        for name in corner_buttons:
+            set_corner_hover(name, False)
+
+    def corner_click(event):
+        for name in corner_buttons:
+            x0, y0, x1, y1 = corner_bounds(name)
+            if x0 <= event.x <= x1 and y0 <= event.y <= y1:
+                if name in {"uninstall", "update"} and not addons.check_idle():
+                    return "break"
+                if name == "uninstall":
+                    def close_for_uninstall() -> None:
+                        root._fbq_uninstall_requested = True
+                        root.destroy()
+
+                    start_uninstall(root, on_uninstall_start=close_for_uninstall)
+                elif name == "help":
+                    open_manual("EN")
+                elif name == "addons":
+                    addons.open_installer()
+                else:
+                    def close_for_update() -> None:
+                        root._fbq_update_requested = True
+                        root.destroy()
+
+                    start_update_check(
+                        root,
+                        on_status=set_update_caption,
+                        on_update_start=close_for_update,
+                    )
+                return "break"
+        launch_easy_tracking()
+
+    easy_panel.bind("<Motion>", corner_motion, add="+")
+    easy_panel.bind("<Leave>", corner_leave, add="+")
+    easy_panel.bind("<Button-1>", corner_click)
+    easy_panel.bind("<Configure>", draw_corner_buttons, add="+")
+    easy_panel.after_idle(draw_corner_buttons)
+
+    def start_update_probe() -> None:
+        threading.Thread(
+            target=probe_updates_in_background,
+            name="FBQ Home update probe",
+            daemon=True,
+        ).start()
+        poll_update_probe()
+
+    # Start only after Tk enters its event loop. Background work reports through
+    # a queue, and only this Tk main thread schedules or performs GUI updates.
+    root.after(100, start_update_probe)
+    root.bind("<F1>", lambda e: open_manual("EN"))
+
+    lower_panels = (
+        ("Fish Behavior\nQuantification", launch_behavior_quantification, "gui_behavior_quantification.py"),
+        ("Cropping\n&\nTrimming", launch_preprocess, "gui_preprocess.py"),
+        ("Segmentation", launch_segmentation, "gui_segmentation.py"),
+        ("Advanced Tracking", launch_advanced_tracking, "gui_advanced_tracking.py"),
+        ("Multi Config Batch", launch_multi_config_batch, "gui_multi_config_batch.py"),
+        ("Refinement", launch_refinement, "gui_refinement.py"),
+        (
+            "Colab (beta)" if sys.platform.startswith("linux") else "Colab（beta）",
+            launch_colab, "gui_colab.py",
+        ),
+    )
+    for col, (text, command, drop_script) in enumerate(lower_panels):
+        panel = make_panel(root, core, text, command, font_size=18)
+        panel.grid(row=1, column=col, sticky="nsew")
+        if drop_script is not None:
+            drop_targets.append((panel, drop_script))
+    return tuple(drop_targets)
+
+
+def install_home_video_drop(
+    root: ctk.CTk, targets: tuple[tuple[tk.Canvas, str], ...],
+) -> None:
+    """Open the target GUI with the video or configuration dropped on its panel."""
+    if not root.winfo_exists():
+        return
+
+    def show_rejection(message: str) -> None:
+        messagebox.showwarning("File drop", message, parent=root)
+
+    for canvas, script in targets:
+        def on_files(paths: tuple[str, ...], target_script: str = script) -> None:
+            try:
+                arguments = home_drop_args(target_script, paths, VIDEO_DROP_SUFFIXES)
+            except ValueError as exc:
+                show_rejection(str(exc))
+                return
+            try:
+                process = launch_gui_script(
+                    target_script, *arguments, capture_errors=True,
+                )
+            except OSError as exc:
+                messagebox.showerror("Unable to open GUI", str(exc), parent=root)
+                return
+
+            # Read stderr continuously so a traceback cannot block the child,
+            # and report a real failure rather than just its numeric exit code.
+            error_lines: deque[str] = deque(maxlen=80)
+
+            def read_errors() -> None:
+                assert process.stderr is not None
+                with process.stderr:
+                    for line in process.stderr:
+                        error_lines.append(line)
+
+            error_reader = threading.Thread(
+                target=read_errors, name="FBQ GUI startup diagnostics",
+                daemon=True,
+            )
+            error_reader.start()
+
+            def check_startup(remaining: int = 10) -> None:
+                status = process.poll()
+                if status is None and remaining > 0:
+                    root.after(1000, lambda: check_startup(remaining - 1))
+                    return
+                if status is None or status == 0:
+                    return
+                if error_reader.is_alive():
+                    root.after(100, lambda: check_startup(0))
+                    return
+
+                traceback_text = "".join(error_lines).strip()
+                details = (
+                    f"\n\n{traceback_text[-3000:]}"
+                    if traceback_text else
+                    "\n\nThe child did not report an error message."
+                )
+                messagebox.showerror(
+                    "Unable to open GUI",
+                    f"{target_script} exited with code {status}.{details}",
+                    parent=root,
+                )
+
+            root.after(1000, check_startup)
+
+        install_canvas_file_drop(
+            root, canvas,
+            allowed_suffixes=home_drop_suffixes(script, VIDEO_DROP_SUFFIXES),
+            on_paths=on_files,
+            allow_multiple=(script == "gui_multi_config_batch.py"),
+            status_callback=show_rejection,
+            label="video or config",
+        )
+
+
+def main() -> int:
+    configure_taskbar_identity()
+    splash_shown_at = time.monotonic()
+    has_external_splash, splash_process = ensure_external_splash()
+    root = ctk.CTk()
+    root._fbq_update_requested = False
+    root._fbq_uninstall_requested = False
+    configure_dpi_scaling(root)
+    root.withdraw()
+    root.title(home_window_title())
+    install_window_icon(root)
+
+    splash: tk.Toplevel | None = None
+    if not has_external_splash:
+        splash_shown_at = time.monotonic()
+        splash = show_splash(root, reveal=True)
+        root.update()  # force the splash to render before the slower setup below
+
+    install_window_icon(root)
+    root.geometry(f"{WINDOW_W}x{WINDOW_H}")
+    root.resizable(True, True)
+    root.minsize(1140, 540)
+    install_window_icon(root)
+
+    home_drop_targets = build_home(root)
+
+    external_start = external_started_at() if has_external_splash else None
+    if external_start is None:
+        elapsed_ms = int((time.monotonic() - splash_shown_at) * 1000)
+    else:
+        elapsed_ms = max(0, int((time.time() - external_start) * 1000))
+    remaining_ms = max(0, min(reveal_total_ms(), MAX_DISPLAY_MS) - elapsed_ms)
+    reveal_job: str | None = None
+    dismiss_poll_job: str | None = None
+    close_poll_job: str | None = None
+    splash_close_started: float | None = None
+    reveal_requested = False
+    main_revealed = False
+
+    def finish_reveal() -> None:
+        nonlocal main_revealed, dismiss_poll_job, close_poll_job
+        if main_revealed:
+            return
+        main_revealed = True
+        dismiss_poll_job = None
+        close_poll_job = None
+        root.deiconify()
+        install_window_icon(root)
+        # Initialize tkdnd after the Home window is visible, without delaying
+        # the splash reveal or altering the existing panel click actions.
+        root.after(100, lambda: install_home_video_drop(root, home_drop_targets))
+        root.after(150, root.FBQ_ADDONS.enable_file_drop)
+        if os.name == "nt":
+            # Windows can leave the owner window stuck with the topmost style
+            # inherited from its topmost splash child; force-clear it.
+            root.attributes("-topmost", True)
+            root.attributes("-topmost", False)
+
+    def wait_for_external_splash_close() -> None:
+        nonlocal close_poll_job
+        close_poll_job = None
+        if external_closed():
+            finish_reveal()
+            return
+        if splash_process is not None:
+            status = splash_process.poll()
+            if status is not None:
+                print(
+                    f"[FBQ] Splash exited without closure confirmation "
+                    f"(exit code {status}); displaying Home.",
+                    flush=True,
+                )
+                finish_reveal()
+                return
+        if (
+            splash_close_started is not None
+            and (time.monotonic() - splash_close_started) * 1000 >= SPLASH_CLOSE_TIMEOUT_MS
+        ):
+            print("[FBQ] Splash closure timed out; displaying Home.", flush=True)
+            if splash_process is not None and splash_process.poll() is None:
+                try:
+                    splash_process.terminate()
+                except OSError:
+                    pass
+            finish_reveal()
+            return
+        close_poll_job = root.after(20, wait_for_external_splash_close)
+
+    def reveal_main_window(_event=None) -> None:
+        nonlocal reveal_requested, reveal_job, dismiss_poll_job, splash_close_started
+        if reveal_requested:
+            return
+        reveal_requested = True
+        if reveal_job is not None:
+            try:
+                root.after_cancel(reveal_job)
+            except tk.TclError:
+                pass
+            reveal_job = None
+        if dismiss_poll_job is not None:
+            try:
+                root.after_cancel(dismiss_poll_job)
+            except tk.TclError:
+                pass
+            dismiss_poll_job = None
+        if has_external_splash:
+            splash_close_started = time.monotonic()
+            signal_stop()
+            wait_for_external_splash_close()
+            return
+        if splash is not None:
+            try:
+                splash.attributes("-fullscreen", False)
+                splash.attributes("-topmost", False)
+                splash.destroy()
+            except tk.TclError:
+                pass
+        finish_reveal()
+
+    def poll_external_splash_dismissal() -> None:
+        nonlocal dismiss_poll_job
+        dismiss_poll_job = None
+        if reveal_requested:
+            return
+        if external_dismissed():
+            reveal_main_window()
+            return
+        dismiss_poll_job = root.after(25, poll_external_splash_dismissal)
+
+    if splash is not None:
+        splash.bind("<ButtonPress>", reveal_main_window, add="+")
+        splash.FBQ_SPLASH_CANVAS.bind("<ButtonPress>", reveal_main_window, add="+")
+    elif has_external_splash:
+        dismiss_poll_job = root.after(25, poll_external_splash_dismissal)
+    reveal_job = root.after(remaining_ms, reveal_main_window)
+    root.mainloop()
+    if getattr(root, "_fbq_uninstall_requested", False):
+        return UNINSTALL_EXIT_CODE
+    return 42 if getattr(root, "_fbq_update_requested", False) else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

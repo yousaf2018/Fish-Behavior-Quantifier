@@ -1,0 +1,831 @@
+# Copyright (C) 2026 Yusuke Notomi
+# SPDX-License-Identifier: AGPL-3.0-only
+
+"""Run the configured tracking stages in order and record their progress."""
+
+import os
+import sys
+import csv
+import codecs
+import concurrent.futures
+import copy
+import subprocess
+import tempfile
+import threading
+import traceback
+import platform
+import importlib.metadata
+import yaml
+from datetime import datetime
+from pathlib import Path
+from typing import List, Optional, Tuple
+
+from behavior_config import behavior_enabled
+from experiment_utils import (
+    DEFAULT_LR0,
+    DEFAULT_LRF,
+    experiment_dir_name_from_cfg,
+    format_lr0_for_name,
+    format_lrf_for_name,
+    parse_lr0_values,
+    parse_lrf_values,
+)
+from path_utils import relativize_config_paths, resolve_config_paths
+from random_utils import normalize_seed
+from roi import describe_roi_population, roi_population_model
+from multi_video_training import run_multi_video_training, training_video_paths
+from tank_roster import (
+    TankConfigurationError,
+    iter_tank_runs,
+    normalize_tanks,
+    tank_parallelism,
+)
+from tracking_video_inputs import configured_tracking_video_files
+from version_info import check_version_status, version_label
+
+try:
+    from .compact_log import CompactChildOutput, GuiProgressPassthrough
+except ImportError:  # Direct ``python main/batch.py`` execution.
+    from compact_log import CompactChildOutput, GuiProgressPassthrough
+
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
+
+from gui.project_paths import MAIN_DIR as MAIN_PATH, PROJECT_ROOT, with_pythonpath
+from main.runtime_diagnostics import runtime_details, runtime_summary_lines, system_details
+
+CURRENT_DIR = str(MAIN_PATH)
+
+INITIAL_TRACKING_SCRIPT = os.path.join(CURRENT_DIR, "initial_tracking.py")
+DIRECTION_CLASS_ASSIGNMENT_SCRIPT = os.path.join(CURRENT_DIR, "direction_class_assignment.py")
+DIRECTION_CLASS_FILTERING_SCRIPT = os.path.join(CURRENT_DIR, "direction_class_filtering.py")
+INTERACTION_IMAGE_SYNTHESIS_SCRIPT = os.path.join(CURRENT_DIR, "interaction_image_synthesis.py")
+INTERACTION_IMAGE_SYNTHESIS_CLUSTERED_SCRIPT = os.path.join(CURRENT_DIR, "interaction_image_synthesis_clustered.py")
+CROP_IMAGES_SCRIPT = os.path.join(CURRENT_DIR, "crop_images.py")
+CREATE_DATASET_SCRIPT = os.path.join(CURRENT_DIR, "create_dataset.py")
+OBB_DETECTOR_TRAINING_SCRIPT = os.path.join(CURRENT_DIR, "obb_detector_training.py")
+OBB_DETECTION_SCRIPT = os.path.join(CURRENT_DIR, "obb_detection.py")
+MULTI_STAGED_ASSOCIATION_SCRIPT = os.path.join(CURRENT_DIR, "multi_staged_association.py")
+REFINEMENT_SCRIPT = os.path.join(CURRENT_DIR, "refinement.py")
+CREATE_TRACKING_VIDEO_SCRIPT = os.path.join(CURRENT_DIR, "create_video.py")
+BEHAVIOR_ANALYSIS_SCRIPT = os.path.join(CURRENT_DIR, "behavior_analysis.py")
+APPLY_CLASS_LABEL_FILTERING_SCRIPT = os.path.join(CURRENT_DIR, "apply_class_label_filtering.py")
+
+_TIMING_CSV_PATH = ""
+_MASTER_SEED = 0
+_ARCHIVE_LOG = None
+_ARCHIVE_LOG_PATH = ""
+_CONSOLE_STDOUT = None
+_CONSOLE_STDERR = None
+
+
+def load_config(path: str) -> dict:
+    with open(path, "r", encoding="utf-8") as f:
+        cfg = yaml.safe_load(f) or {}
+    if not isinstance(cfg, dict):
+        raise ValueError("Configuration root must be a mapping.")
+    return resolve_config_paths(cfg)
+
+
+class TeeStream:
+    def __init__(self, *streams):
+        self.streams = streams
+        self.encoding = getattr(streams[0], "encoding", "utf-8") if streams else "utf-8"
+        self.errors = getattr(streams[0], "errors", "replace") if streams else "replace"
+
+    def write(self, data):
+        for stream in self.streams:
+            try:
+                stream.write(data)
+            except UnicodeEncodeError:
+                encoding = getattr(stream, "encoding", None) or "utf-8"
+                safe = data.encode(encoding, errors="replace").decode(encoding, errors="replace")
+                stream.write(safe)
+        return len(data)
+
+    def flush(self):
+        for stream in self.streams:
+            stream.flush()
+
+    def isatty(self):
+        return any(getattr(stream, "isatty", lambda: False)() for stream in self.streams)
+
+
+def _package_version(name: str) -> str:
+    try:
+        return importlib.metadata.version(name)
+    except importlib.metadata.PackageNotFoundError:
+        return "unavailable"
+    except Exception as exc:
+        return f"unavailable ({exc})"
+
+
+def _write_archive(text: str) -> None:
+    if _ARCHIVE_LOG is None or not text:
+        return
+    _ARCHIVE_LOG.write(text)
+    _ARCHIVE_LOG.flush()
+
+
+def _begin_logging(config_path: str) -> str:
+    global _ARCHIVE_LOG, _ARCHIVE_LOG_PATH, _CONSOLE_STDOUT, _CONSOLE_STDERR
+    cfg_abs = os.path.abspath(config_path)
+    cfg_dir = os.path.dirname(cfg_abs) or os.getcwd()
+    log_path = os.path.join(cfg_dir, "log.txt")
+    if _ARCHIVE_LOG is not None and _ARCHIVE_LOG_PATH == log_path:
+        return log_path
+    if _ARCHIVE_LOG is not None:
+        _finish_logging("replaced")
+    if _CONSOLE_STDOUT is None:
+        _CONSOLE_STDOUT = sys.stdout
+        _CONSOLE_STDERR = sys.stderr
+    _ARCHIVE_LOG_PATH = log_path
+    _ARCHIVE_LOG = open(log_path, "a", encoding="utf-8", buffering=1)
+    version_status = check_version_status(timeout=2.0)
+    runtime = runtime_details()
+    system = system_details()
+    separator = (
+        f"=== FBQ {version_label(version_status.current)} RUN START "
+        f"{_iso_timestamp()} PID={os.getpid()} ===\n"
+    )
+    _write_archive(separator)
+    header = [
+        f"fbq_version={runtime['fbq_version']}",
+        f"latest_version={version_status.latest or 'unavailable'}",
+        f"update_status={version_status.state}",
+        f"python_executable={runtime['python_executable']}",
+        f"python_version={runtime['python_version']}",
+        f"platform={platform.platform()}",
+        f"machine={platform.machine()}",
+        f"cpu_model={system['cpu_model']}",
+        f"cpu_cores={system['cpu_cores']}",
+        f"ram_total_gib={system['ram_total_gib']}",
+        f"ram_used_gib={system['ram_used_gib']}",
+        f"swap_used_gib={system['swap_used_gib']}",
+        f"power_source={system['power_source']}",
+        f"cwd={os.getcwd()}",
+        f"config_path={cfg_abs}",
+        f"argv={sys.argv!r}",
+        f"torch_version={runtime['torch_version']}",
+        f"cuda_runtime={runtime['cuda_runtime']}",
+        f"rocm_runtime={runtime['rocm_runtime']}",
+        f"gpu_backend={runtime['gpu_backend']}",
+        f"gpu_available={runtime['gpu_available']}",
+        f"gpu_devices={runtime['gpu_devices']}",
+        f"automatic_torch_device={runtime['automatic_torch_device']}",
+        f"torchvision_version={_package_version('torchvision')}",
+        f"ultralytics_version={_package_version('ultralytics')}",
+    ]
+    # Capacity is recorded before any training begins, even if epoch 1 fails.
+    for key in ("vram_total_device", "vram_total_gib", "vram_by_device_gib", "mps_recommended_gib"):
+        if key in runtime:
+            header.append(f"{key}={runtime[key]}")
+    if runtime["gpu_backend"] == "Apple MPS":
+        header.extend(
+            f"{name}={os.environ.get(name, 'unset')}"
+            for name in (
+                "PYTORCH_ENABLE_MPS_FALLBACK",
+                "PYTORCH_MPS_HIGH_WATERMARK_RATIO",
+                "PYTORCH_MPS_LOW_WATERMARK_RATIO",
+            )
+        )
+    _write_archive("[RUN HEADER] " + "\n[RUN HEADER] ".join(header) + "\n")
+    sys.stdout = TeeStream(_CONSOLE_STDOUT, _ARCHIVE_LOG)
+    sys.stderr = TeeStream(_CONSOLE_STDERR, _ARCHIVE_LOG)
+    print(f"[FBQ] Version: {version_label(version_status.current)}", flush=True)
+    for line in runtime_summary_lines(runtime)[1:]:
+        print(line, flush=True)
+    if version_status.latest is None:
+        print("[FBQ] Latest version: unavailable (offline or update check failed)", flush=True)
+    elif version_status.update_available:
+        print(
+            f"[FBQ] Update available: {version_label(version_status.current)} "
+            f"-> {version_label(version_status.latest)}",
+            flush=True,
+        )
+    elif version_status.state == "up_to_date":
+        print(f"[FBQ] Latest version: {version_label(version_status.latest)} (up to date)", flush=True)
+    else:
+        print(
+            f"[FBQ] Latest version: {version_label(version_status.latest)} "
+            "(installed version is newer)",
+            flush=True,
+        )
+    print(f"Saving CLI log to: {log_path}", flush=True)
+    return log_path
+
+
+def _finish_logging(status: str) -> None:
+    global _ARCHIVE_LOG, _ARCHIVE_LOG_PATH
+    if _ARCHIVE_LOG is None:
+        return
+    _write_archive(f"=== FBQ RUN END {_iso_timestamp()} PID={os.getpid()} status={status} ===\n")
+    try:
+        _ARCHIVE_LOG.flush()
+        os.fsync(_ARCHIVE_LOG.fileno())
+    except (OSError, ValueError):
+        pass
+    _ARCHIVE_LOG.close()
+    if _CONSOLE_STDOUT is not None:
+        sys.stdout = _CONSOLE_STDOUT
+    if _CONSOLE_STDERR is not None:
+        sys.stderr = _CONSOLE_STDERR
+    _ARCHIVE_LOG = None
+    _ARCHIVE_LOG_PATH = ""
+
+
+def _timestamp(dt: datetime | None = None) -> str:
+    return (dt or datetime.now()).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _iso_timestamp(dt: datetime | None = None) -> str:
+    return (dt or datetime.now()).isoformat(timespec="seconds")
+
+
+def _init_timing_csv(path: str) -> None:
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["stage", "script", "status", "start_time", "end_time", "elapsed_seconds", "elapsed"])
+
+
+def _append_timing_row(
+    *,
+    stage: str,
+    script: str,
+    status: str,
+    start: datetime,
+    end: datetime,
+) -> None:
+    if not _TIMING_CSV_PATH:
+        return
+    elapsed = end - start
+    with open(_TIMING_CSV_PATH, "a", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            stage,
+            script,
+            status,
+            _iso_timestamp(start),
+            _iso_timestamp(end),
+            f"{elapsed.total_seconds():.3f}",
+            _fmt_elapsed(elapsed),
+        ])
+
+
+def run(cmd: list[str]) -> None:
+    print(f"\n>>> {' '.join(cmd)}", flush=True)
+
+    env = os.environ.copy()
+    env["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+    env["PYTHONIOENCODING"] = "utf-8"
+    env["PYTHONUTF8"] = "1"
+    env["PYTHONUNBUFFERED"] = "1"
+    env["PYTHONFAULTHANDLER"] = "1"
+    env.setdefault("TQDM_ASCII", " 123456789#")
+    env.setdefault("COLUMNS", "120")
+    env["PYTHONHASHSEED"] = str(_MASTER_SEED % (2**32))
+    with_pythonpath(env, PROJECT_ROOT, MAIN_PATH)
+
+    proc = subprocess.Popen(
+        cmd,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        # Keep progress output responsive.  The child scripts are already invoked
+        # with -u, and this prevents the intermediate pipe from adding extra
+        # buffering in batch.py.
+        bufsize=0,
+    )
+    assert proc.stdout is not None
+    console = _CONSOLE_STDOUT or sys.stdout
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+    output_filter = CompactChildOutput(
+        training=any(os.path.basename(str(arg)) == "obb_detector_training.py" for arg in cmd)
+    )
+    gui_progress_protocol = os.environ.get("FBQ_GUI_PROGRESS_PROTOCOL", "").strip().lower() in {
+        "1", "true", "yes"
+    }
+    gui_output = GuiProgressPassthrough() if gui_progress_protocol else None
+    while True:
+        chunk = proc.stdout.read(512)
+        if not chunk:
+            break
+        text = decoder.decode(chunk, final=False)
+        if not text:
+            continue
+        compact = output_filter.feed(text)
+        if compact:
+            _write_archive(compact)
+        visible = gui_output.feed(text) if gui_output is not None else compact
+        if visible:
+            console.write(visible)
+            console.flush()
+    tail = decoder.decode(b"", final=True)
+    compact_tail = output_filter.feed(tail) + output_filter.flush()
+    if compact_tail:
+        _write_archive(compact_tail)
+    visible_tail = (
+        gui_output.feed(tail) + gui_output.flush()
+        if gui_output is not None
+        else compact_tail
+    )
+    if visible_tail:
+        console.write(visible_tail)
+        console.flush()
+    summary = output_filter.summary_line()
+    if summary:
+        _write_archive(summary)
+        console.write(summary)
+        console.flush()
+    rc = proc.wait()
+    exit_line = f"[INFO] child exit: {rc}\n"
+    _write_archive(exit_line)
+    console.write(exit_line)
+    console.flush()
+
+    if rc != 0:
+        if rc < 0:
+            try:
+                import signal
+                signal_name = signal.Signals(-rc).name
+            except (ValueError, ImportError):
+                signal_name = "unknown signal"
+            signal_line = f"[ERROR] child terminated by signal {-rc} ({signal_name})\n"
+            _write_archive(signal_line)
+            console.write(signal_line)
+            console.flush()
+        raise RuntimeError(f"Command failed with exit code {rc}: {' '.join(cmd)}")
+
+def _fmt_elapsed(td) -> str:
+    total = int(td.total_seconds())
+    h, rem = divmod(total, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h:02d}:{m:02d}:{s:02d}"
+
+def run_script(script: str, *args: str) -> None:
+    name = os.path.splitext(os.path.basename(script))[0].removesuffix("_variable")
+    start = datetime.now()
+    status = "success"
+    print(f"\n[{_timestamp(start)}] START: {name}", flush=True)
+    cmd = [sys.executable, "-u", script] + list(args)
+    try:
+        run(cmd)
+    except Exception:
+        status = "failed"
+        raise
+    finally:
+        end = datetime.now()
+        label = "END" if status == "success" else "FAIL"
+        print(f"[{_timestamp(end)}] {label}:   {name}  (elapsed: {_fmt_elapsed(end - start)})", flush=True)
+        _append_timing_row(stage=name, script=script, status=status, start=start, end=end)
+
+
+def skip_stage(stage: str, reason: str = "") -> None:
+    now = datetime.now()
+    suffix = f" ({reason})" if reason else ""
+    print(f"[{_timestamp(now)}] SKIP:  {stage}{suffix} (elapsed: 00:00:00)", flush=True)
+    _append_timing_row(stage=stage, script="", status="skipped", start=now, end=now)
+
+
+def _behavior_analysis_enabled(cfg: dict) -> bool:
+    """Return True when the behaviour analysis stage should run."""
+    return behavior_enabled(cfg)
+
+
+def run_lrf_independent_stages(cfg: dict, cfg_path: str) -> None:
+    """Run preprocessing and dataset creation exactly once per batch."""
+    if cfg.get("skip_initial_tracking", False):
+        skip_stage("initial_tracking", "skip_initial_tracking is True")
+    else:
+        print("Running initial tracking...")
+        run_script(INITIAL_TRACKING_SCRIPT, cfg_path)
+        cfg.clear()
+        cfg.update(load_config(cfg_path))
+
+    if cfg.get("skip_trajectory_direction_filtering", False):
+        skip_stage("direction_class_assignment", "skip_trajectory_direction_filtering is True")
+    else:
+        print("Creating single animal images (trajectory / direction filtering)...")
+        run_script(DIRECTION_CLASS_ASSIGNMENT_SCRIPT, cfg_path)
+
+    if cfg.get("skip_refine_blobs_through_tracking", False):
+        skip_stage("direction_class_filtering", "skip_refine_blobs_through_tracking is True")
+    else:
+        print("Running iterative refine blobs through training...")
+        run_script(DIRECTION_CLASS_FILTERING_SCRIPT, cfg_path)
+
+    if cfg.get("skip_paste_blobs_clustered", False):
+        skip_stage("interaction_image_synthesis_clustered", "skip_paste_blobs_clustered is True")
+    else:
+        print("Creating clustered pasted blobs...")
+        run_script(INTERACTION_IMAGE_SYNTHESIS_CLUSTERED_SCRIPT, cfg_path)
+
+    if cfg.get("skip_paste_blobs_with_crossing", False):
+        skip_stage("interaction_image_synthesis", "skip_paste_blobs_with_crossing is True")
+    else:
+        print("Creating mixed pasted blobs...")
+        run_script(INTERACTION_IMAGE_SYNTHESIS_SCRIPT, cfg_path)
+
+    if cfg.get("skip_creating_direction_dataset", False):
+        skip_stage("crop_images", "skip_creating_direction_dataset is True")
+    elif cfg.get("skip_cropping", False):
+        skip_stage("crop_images", "skip_cropping is True")
+    else:
+        print("Starting cropping process...")
+        run_script(CROP_IMAGES_SCRIPT, cfg_path)
+
+    if cfg.get("skip_creating_direction_dataset", False):
+        skip_stage("create_dataset", "skip_creating_direction_dataset is True")
+    else:
+        print("Creating direction-estimation dataset...")
+        run_script(CREATE_DATASET_SCRIPT, cfg_path)
+
+    if cfg.get("skip_behavior_analysis", False):
+        skip_stage("behavior_analysis", "skip_behavior_analysis is True")
+    elif cfg.get("skip_trajectory_direction_filtering", False):
+        skip_stage("behavior_analysis", "the direction stage was skipped")
+    elif not _behavior_analysis_enabled(cfg):
+        skip_stage("behavior_analysis", "BEHAVIOR.ENABLE is False")
+    else:
+        print("Analysing fish behaviour...")
+        run_script(BEHAVIOR_ANALYSIS_SCRIPT, cfg_path)
+
+
+def run_lrf_dependent_stages(cfg: dict, cfg_path: str) -> None:
+    """Run stages whose inputs/outputs belong to one LRF experiment."""
+    if cfg.get("skip_training", False):
+        skip_stage("obb_detector_training", "skip_training is True")
+    else:
+        print("Starting direction-estimation training...")
+        run_script(OBB_DETECTOR_TRAINING_SCRIPT, cfg_path)
+
+    from cache_integrity import validate_skipped_analysis
+    validate_skipped_analysis(cfg)
+
+    if cfg.get("skip_detection", False):
+        skip_stage("obb_detection", "skip_detection is True")
+    else:
+        print("Starting object detection process...")
+        run_script(OBB_DETECTION_SCRIPT, cfg_path)
+
+    if cfg.get("skip_id_tracking", False):
+        skip_stage("multi_staged_association", "skip_id_tracking is True")
+    else:
+        print("Starting ID tracking process...")
+        run_script(os.path.join(CURRENT_DIR, "multi_staged_association_variable.py") if cfg.get("VARIABLE_NUM_OBJECTS", False) else MULTI_STAGED_ASSOCIATION_SCRIPT, cfg_path)
+
+    # Keep refinement independently resumable. Easy Tracking marks each
+    # completed stage skip=true, so after ID tracking finishes a stopped run
+    # must be able to skip the completed association and continue refinement.
+    if cfg.get("skip_refinement", False):
+        skip_stage("refinement", "skip_refinement is True")
+    else:
+        print("Starting refinement...")
+        run_script(os.path.join(CURRENT_DIR, "refinement_variable.py") if cfg.get("VARIABLE_NUM_OBJECTS", False) else REFINEMENT_SCRIPT, cfg_path)
+
+    if cfg.get("skip_creating_video", False):
+        skip_stage("create_video", "skip_creating_video is True")
+    else:
+        print("Creating tracking video...")
+        run_script(CREATE_TRACKING_VIDEO_SCRIPT, cfg_path)
+
+
+def _run_configuration(cfg: dict, cfg_path: str) -> None:
+    """Run the twelve stages for one configuration.
+
+    The configuration is either the whole rig or a single tank; the two are
+    indistinguishable for the stages themselves.
+    """
+    training_cfg = cfg.get("training", {}) or {}
+    if not isinstance(training_cfg, dict):
+        raise ValueError("training must be a mapping.")
+    lr0_values = parse_lr0_values(training_cfg.get("LR0", DEFAULT_LR0))
+    lrf_values = parse_lrf_values(training_cfg.get("LRF", DEFAULT_LRF))
+
+    _batch_start = datetime.now()
+
+    run_lrf_independent_stages(cfg, cfg_path)
+
+    lr_pairs = [
+        (current_lr0, current_lrf)
+        for current_lr0 in lr0_values
+        for current_lrf in lrf_values
+    ]
+    with tempfile.TemporaryDirectory(prefix="fbq_lr_") as temp_cfg_dir:
+        total_lr = len(lr_pairs)
+        for index, (current_lr0, current_lrf) in enumerate(lr_pairs, start=1):
+            run_cfg = copy.deepcopy(cfg)
+            run_training = run_cfg.setdefault("training", {})
+            run_training["LR0"] = current_lr0
+            run_training["LRF"] = current_lrf
+            experiment_name = experiment_dir_name_from_cfg(run_cfg)
+            lr0_text = format_lr0_for_name(current_lr0)
+            lrf_text = format_lrf_for_name(current_lrf)
+            print(
+                f"\n[LR BATCH] {index}/{total_lr} "
+                f"lr0={lr0_text} lrf={lrf_text} experiment={experiment_name}",
+                flush=True,
+            )
+
+            temp_cfg_path = os.path.join(temp_cfg_dir, f"config_lr_{index}.yaml")
+            with open(temp_cfg_path, "w", encoding="utf-8") as f:
+                yaml.safe_dump(run_cfg, f, sort_keys=False, allow_unicode=True)
+
+            try:
+                run_lrf_dependent_stages(run_cfg, temp_cfg_path)
+            except Exception as exc:
+                raise RuntimeError(
+                    f"LR batch failed at {index}/{total_lr}: "
+                    f"lr0={lr0_text}, lrf={lrf_text}, experiment={experiment_name}"
+                ) from exc
+
+    _batch_end = datetime.now()
+    print(f"\n[{_batch_end.strftime('%Y-%m-%d %H:%M:%S')}] All steps done. Total elapsed: {_fmt_elapsed(_batch_end - _batch_start)}", flush=True)
+
+
+def _tank_run_configs(cfg: dict) -> List[Tuple[dict, dict, Optional[str]]]:
+    """Build one derived configuration per tank of the roster."""
+    videos = configured_tracking_video_files(cfg)
+    return list(iter_tank_runs(cfg, videos))
+
+
+def _write_tank_config(run_cfg: dict) -> str:
+    """Write the derived configuration of one tank and return its path."""
+    tank_dir = str(run_cfg["SESSION_PATH"])
+    os.makedirs(tank_dir, exist_ok=True)
+    tank_cfg_path = os.path.join(tank_dir, "config.yaml")
+    with open(tank_cfg_path, "w", encoding="utf-8") as f:
+        yaml.safe_dump(
+            relativize_config_paths(run_cfg), f, sort_keys=False, allow_unicode=True,
+        )
+    return tank_cfg_path
+
+
+def _spawn_tank_process(tank_cfg_path: str) -> subprocess.Popen:
+    """Start the pipeline of one tank in its own process."""
+    cmd = [sys.executable, "-u", os.path.join(CURRENT_DIR, "batch.py"), tank_cfg_path]
+    env = os.environ.copy()
+    env["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+    env["PYTHONIOENCODING"] = "utf-8"
+    env["PYTHONUTF8"] = "1"
+    env["PYTHONUNBUFFERED"] = "1"
+    env["PYTHONFAULTHANDLER"] = "1"
+    env.setdefault("TQDM_ASCII", " 123456789#")
+    env.setdefault("COLUMNS", "120")
+    env["PYTHONHASHSEED"] = str(_MASTER_SEED % (2**32))
+    with_pythonpath(env, PROJECT_ROOT, MAIN_PATH)
+    return subprocess.Popen(
+        cmd,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        bufsize=0,
+    )
+
+
+def _stream_child_output(proc: subprocess.Popen) -> None:
+    """Copy the output of a child process to the console of this process."""
+    console = _CONSOLE_STDOUT or sys.stdout
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+    if proc.stdout is None:
+        return
+    while True:
+        chunk = proc.stdout.read(512)
+        if not chunk:
+            break
+        text = decoder.decode(chunk, final=False)
+        if text:
+            console.write(text)
+            console.flush()
+    tail = decoder.decode(b"", final=True)
+    if tail:
+        console.write(tail)
+        console.flush()
+
+
+def _run_tanks_at_the_same_time(
+    entries: List[Tuple[int, dict, str]], max_workers: int,
+) -> None:
+    """Process every ROI of the roster at the same time.
+
+    Each tank runs the whole pipeline in its own process, so several tanks
+    are analysed concurrently instead of one after the other. A tank that
+    fails aborts the whole roster, as every other stage does.
+    """
+    registry: dict = {}
+    lock = threading.Lock()
+
+    def _task(entry: Tuple[int, dict, str]) -> None:
+        index, tank, tank_cfg_path = entry
+        label = str(tank["id"])
+        proc = _spawn_tank_process(tank_cfg_path)
+        with lock:
+            registry[label] = proc
+        try:
+            _stream_child_output(proc)
+            code = proc.wait()
+        finally:
+            with lock:
+                registry.pop(label, None)
+        if code != 0:
+            raise RuntimeError(
+                f"Tank {label} failed with exit code {code}: {tank_cfg_path}"
+            )
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = {pool.submit(_task, entry): entry for entry in entries}
+        try:
+            for future in concurrent.futures.as_completed(futures):
+                future.result()
+        except Exception:
+            for future in futures:
+                future.cancel()
+            with lock:
+                running = list(registry.values())
+            for proc in running:
+                try:
+                    proc.terminate()
+                except OSError:
+                    pass
+            raise
+
+
+def _run_tank_roster(cfg: dict, cfg_path: str) -> None:
+    """Run the pipeline once per tank of the configured roster."""
+    runs = _tank_run_configs(cfg)
+    if not runs:
+        raise TankConfigurationError("The tank roster did not produce any run.")
+
+    entries: List[Tuple[int, dict, str]] = []
+    for index, (tank, run_cfg, video) in enumerate(runs, start=1):
+        tank_cfg_path = _write_tank_config(run_cfg)
+        entries.append((index, tank, tank_cfg_path))
+        print(
+            f"\n[TANK {index}/{len(runs)}] {tank['id']} ({tank['name']}) "
+            f"view={tank['view']} fish={tank.get('fish_count') if tank.get('fish_count') is not None else '-'} "
+            f"video={os.path.basename(str(video)) if video else '-'}",
+            flush=True,
+        )
+        print(f"[TANK {index}/{len(runs)}] session: {run_cfg['SESSION_PATH']}", flush=True)
+
+    parallel, max_workers = tank_parallelism(cfg, len(entries))
+    if not parallel or len(entries) == 1:
+        for index, tank, tank_cfg_path in entries:
+            print(f"[TANK {index}/{len(entries)}] running {tank['id']}", flush=True)
+            _run_configuration(
+                load_config(tank_cfg_path), tank_cfg_path,
+            )
+        return
+
+    print(
+        f"[TANKS] processing {len(entries)} ROIs at the same time "
+        f"({max_workers} at once)",
+        flush=True,
+    )
+    _run_tanks_at_the_same_time(entries, max_workers)
+    print(f"\n[TANKS] all {len(entries)} ROIs finished", flush=True)
+
+
+def _apply_expected_animal_count(cfg: dict) -> None:
+    """Take the expected population from the animal counts of the ROIs.
+
+    Every ROI may declare how many animals it holds and whether that number
+    is exact. When every ROI has a fixed population, their sum is the
+    population of the run, so it becomes the number of objects the tracker
+    expects. A crowded or estimated ROI means the number of animals is not
+    known exactly, so the run switches to the variable-population mode and
+    the declared counts stay expectations. A configuration that already
+    states a number of objects keeps it, and a disagreement is reported
+    instead of silently ignored.
+    """
+    roi_sets = cfg.get("ROI_SETS") or []
+    model = roi_population_model(roi_sets)
+    if not model["rois"]:
+        return
+    expected = int(model["total_expected"])
+    try:
+        configured = int(cfg.get("NUM_OBJECTS", 0) or 0)
+    except (TypeError, ValueError):
+        configured = 0
+    print(f"[ROI] population: {describe_roi_population(roi_sets)}")
+    if expected > 0:
+        if configured <= 0:
+            cfg["NUM_OBJECTS"] = expected
+            print(f"[ROI] the ROI counts declare {expected} animals; using it as NUM_OBJECTS")
+        elif configured != expected:
+            print(
+                f"[ROI] warning: the ROI counts declare {expected} animals but "
+                f"NUM_OBJECTS is {configured}; the configured value is used."
+            )
+    elif model["variable"]:
+        print(
+            "[ROI] no ROI declares an exact number of animals; the configured "
+            "NUM_OBJECTS is kept as a hint."
+        )
+    if model["variable"]:
+        if not cfg.get("VARIABLE_NUM_OBJECTS", False):
+            print(
+                "[ROI] at least one ROI declares an estimated or crowded population; "
+                "the run uses the variable-population mode."
+            )
+        cfg["VARIABLE_NUM_OBJECTS"] = True
+
+
+def _check_video_paths(cfg: dict) -> None:
+    """Report a video path that cannot be read before the stages need it.
+
+    The tracking video is essential, so a missing one stops the run. The
+    training video is only a reference for the frame count, so a missing one
+    is reported and the analysis continues with the tracking video.
+    """
+    tracking = str(cfg.get("TRACKING_VIDEO_PATH", "") or "")
+    if tracking and not os.path.isfile(tracking):
+        raise FileNotFoundError(
+            f"The tracking video {tracking!r} does not exist. Check "
+            "TRACKING_VIDEO_PATH in the configuration file."
+        )
+    training = str(cfg.get("TRAINING_VIDEO_PATH", "") or "")
+    if training and not os.path.isfile(training):
+        print(
+            f"[WARN] the training video {training!r} does not exist; the stages "
+            "that only need a frame count will use the tracking video instead.",
+            flush=True,
+        )
+
+
+def _main_impl() -> None:
+    global _MASTER_SEED, _TIMING_CSV_PATH
+
+    session_path = ""
+
+    cfg_path = sys.argv[1]
+    cfg_path_abs = os.path.abspath(cfg_path)
+    cfg_dir = os.path.dirname(cfg_path_abs) or os.getcwd()
+    _TIMING_CSV_PATH = os.path.join(cfg_dir, "time.csv")
+    _init_timing_csv(_TIMING_CSV_PATH)
+    log_path = _begin_logging(cfg_path)
+
+    cfg = load_config(cfg_path)
+
+    _MASTER_SEED = normalize_seed(cfg.get("RANDOM_SEED", 0))
+    print(f"[SEED] RANDOM_SEED={_MASTER_SEED}")
+
+    _apply_expected_animal_count(cfg)
+    _check_video_paths(cfg)
+
+    print(f"Using configuration: {cfg_path}")
+    print(f"Saving timing CSV to: {_TIMING_CSV_PATH}")
+
+    tanks = normalize_tanks(cfg.get("TANKS"))
+    _batch_start = datetime.now()
+    if tanks:
+        # Every tank prepares its own dataset, so the videos are handled there.
+        _run_tank_roster(cfg, cfg_path)
+    else:
+        if len(training_video_paths(cfg)) > 1:
+            run_multi_video_training(cfg, cfg_path, run_lrf_independent_stages)
+        _run_configuration(cfg, cfg_path)
+    _batch_end = datetime.now()
+
+    _append_timing_row(
+        stage="batch_total",
+        script="batch.py",
+        status="success",
+        start=_batch_start,
+        end=_batch_end,
+    )
+    _write_archive("[INFO] batch completed successfully\n")
+
+
+def main() -> None:
+    cfg_path = sys.argv[1]
+    _begin_logging(cfg_path)
+    status = "success"
+    try:
+        _main_impl()
+    except BaseException:
+        status = "failed"
+        traceback.print_exc()
+        raise
+    finally:
+        _finish_logging(status)
+
+
+if __name__ == "__main__":
+    if len(sys.argv) < 2:
+        raise SystemExit("Usage: batch.py CONFIG_PATH")
+    _begin_logging(sys.argv[1])
+    try:
+        if load_config(sys.argv[1]).get("WITHOUT_DIRECTION_ESTIMATION", False):
+            from without_direction_estimation import prepare_config
+            from without_direction_estimation.batch import main as run_without_direction
+            sys.argv[1] = prepare_config(sys.argv[1])
+            _finish_logging("dispatch")
+            run_without_direction()
+        else:
+            main()
+    except BaseException:
+        traceback.print_exc()
+        _finish_logging("failed")
+        raise
