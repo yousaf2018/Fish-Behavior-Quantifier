@@ -6,7 +6,7 @@
 
 ---
 
-# FBQ — Fish Behavior Quantifier
+# Fish Behavior Quantifier FBQ
 
 **Annotation-free multi-fish tracking and behavior quantification for laboratory videos.**
 
