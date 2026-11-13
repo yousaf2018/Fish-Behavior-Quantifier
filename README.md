@@ -12,8 +12,9 @@
 
 FBQ is a markerless multi-fish tracking system for laboratory tank recordings. It estimates head, center, and tail keypoints for every fish while maintaining individual identities over time. **No manual training annotation and no physical marking is required** — the model learns directly from the videos you provide.
 
-This is a **derivative work** of the original AMADEUS project (Notomi, Matsumura & Dobata, 2026), reworked for fish behavior work. See [Attribution and upstream](#attribution-and-upstream) and [License](#license).
+[![Watch the Tool Demonstration](https://img.youtube.com/vi/6EdLrUhgD30/maxresdefault.jpg)](https://www.youtube.com/watch?v=6EdLrUhgD30)
 
+**▶ Watch the complete tool demonstration on YouTube**
 ---
 
 ## Quick Start
