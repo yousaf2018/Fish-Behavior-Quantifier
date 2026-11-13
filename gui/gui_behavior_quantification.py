@@ -11,13 +11,15 @@ from __future__ import annotations
 
 import os
 import sys
+import json
+import time
 import threading
 import queue
 import subprocess
 import tkinter as tk
 from tkinter import filedialog, messagebox
 from typing import Optional, List, Dict, Any
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, asdict
 
 import cv2
 import customtkinter as ctk
@@ -29,6 +31,56 @@ if PROJECT_ROOT not in sys.path:
 
 from main.path_utils import resolve_config_paths, to_relative_path
 from tools.project_meta import PROJECT_DISPLAY_NAME as PROJECT_NAME
+from tools.settings_manager import (
+    create_default_session_settings,
+    find_session_dir_from_videos,
+    get_session_settings_path,
+    load_session_settings,
+    merge_settings,
+    save_session_settings,
+)
+
+# Settings persistence file (user config directory) - legacy fallback
+SETTINGS_DIR = os.path.expanduser(os.path.join("~", ".config", "fbq"))
+SETTINGS_FILE = os.path.join(SETTINGS_DIR, "behavior_quantification_settings.json")
+
+
+def _start_maximized(window: tk.Tk) -> None:
+    """Make window full-screen on all platforms."""
+    def maximize() -> None:
+        if sys.platform == "darwin":
+            try:
+                window.attributes("-fullscreen", True)
+                window.update_idletasks()
+                return
+            except Exception:
+                pass
+
+        try:
+            window.state("zoomed")
+            window.update_idletasks()
+            if str(window.state()) == "zoomed":
+                return
+        except Exception:
+            pass
+
+        try:
+            window.attributes("-zoomed", True)
+            window.update_idletasks()
+            return
+        except Exception:
+            pass
+
+        try:
+            screen_w = window.winfo_screenwidth()
+            screen_h = window.winfo_screenheight()
+            window.geometry(f"{screen_w}x{screen_h}+0+0")
+        except Exception:
+            pass
+
+    maximize()
+    for delay_ms in (50, 250, 1000):
+        window.after(delay_ms, maximize)
 
 
 @dataclass
@@ -52,8 +104,11 @@ class BehaviorQuantificationGUI(ctk.CTk):
     def __init__(self):
         super().__init__()
         self.title(f"{PROJECT_NAME} — Fish Behavior Quantification")
-        self.geometry("1000x700")
-        self.minsize(900, 600)
+        # Full screen
+        screen_w = self.winfo_screenwidth()
+        screen_h = self.winfo_screenheight()
+        self.geometry(f"{screen_w}x{screen_h}+0+0")
+        self.minsize(1000, 700)
 
         ctk.set_appearance_mode("dark")
         ctk.set_default_color_theme("blue")
@@ -65,7 +120,30 @@ class BehaviorQuantificationGUI(ctk.CTk):
         self._queue: queue.Queue = queue.Queue()
         self._worker: Optional[threading.Thread] = None
 
+        # Video playback state
+        self._video_cap = None
+        self._video_fps = 30
+        self._video_total_frames = 0
+        self._video_playing = False
+        self._canvas_photo = None
+
+        # Tracking results for endpoints extraction
+        self._tracking_results: Dict[str, str] = {}  # video_path -> tracking_csv
+        self._session_path = ""
+        
+        # Endpoints extraction settings (shared with endpoints dialog)
+        self._endpoints_metric_selections: Dict[str, bool] = {}
+        self._endpoints_global_config: Dict[str, Any] = {}
+        self._endpoints_arena_configs: Dict[str, Any] = {}
+        self._endpoints_calibration_ratio: Optional[float] = None
+        
         self._build_ui()
+
+        # Load persisted settings after UI is built
+        self._load_settings()
+        
+        # Ensure full-screen
+        _start_maximized(self)
 
     def _build_ui(self):
         # Top bar
@@ -136,6 +214,9 @@ class BehaviorQuantificationGUI(ctk.CTk):
         ctk.CTkLabel(header_row, text="Raw Videos", font=ctk.CTkFont(weight="bold")).pack(side="left")
         ctk.CTkButton(
             header_row, text="+ Add Video", width=100, command=self._add_video
+        ).pack(side="right", padx=(5, 0))
+        ctk.CTkButton(
+            header_row, text="📁 Load Folder", width=100, command=self._load_videos_from_folder
         ).pack(side="right")
 
         self._video_list_frame = ctk.CTkFrame(video_frame, corner_radius=0)
@@ -213,6 +294,17 @@ class BehaviorQuantificationGUI(ctk.CTk):
             row=1, column=2, padx=10, pady=5
         )
 
+        # Endpoints output directory
+        ep_out_frame = ctk.CTkFrame(out_frame, corner_radius=0)
+        ep_out_frame.grid(row=2, column=0, columnspan=3, sticky="ew", padx=10, pady=(5, 10))
+        ep_out_frame.grid_columnconfigure(1, weight=1)
+        ctk.CTkLabel(ep_out_frame, text="Endpoints Output:").grid(row=0, column=0, sticky="w", padx=5, pady=5)
+        self._endpoints_output_entry = ctk.CTkEntry(ep_out_frame, placeholder_text="Same as output directory (optional)")
+        self._endpoints_output_entry.grid(row=0, column=1, sticky="ew", padx=5, pady=5)
+        ctk.CTkButton(ep_out_frame, text="Browse", width=80, command=self._browse_endpoints_output).grid(
+            row=0, column=2, padx=5, pady=5
+        )
+
         # Run button
         self._run_btn = ctk.CTkButton(
             left,
@@ -223,6 +315,19 @@ class BehaviorQuantificationGUI(ctk.CTk):
         )
         self._run_btn.pack(fill="x", pady=10)
 
+        # Endpoints extraction button (enabled after tracking completes)
+        self._endpoints_btn = ctk.CTkButton(
+            left,
+            text="📊 Extract Behavioral Endpoints",
+            height=40,
+            font=ctk.CTkFont(size=13, weight="bold"),
+            fg_color="#5b2c91",
+            hover_color="#4a2373",
+            command=self._run_endpoints_extraction,
+            state="disabled",
+        )
+        self._endpoints_btn.pack(fill="x", pady=(0, 10))
+
         # Progress
         self._progress = ctk.CTkProgressBar(left)
         self._progress.pack(fill="x", pady=(0, 5))
@@ -231,53 +336,20 @@ class BehaviorQuantificationGUI(ctk.CTk):
         self._status_label = ctk.CTkLabel(left, text="Ready", text_color="gray")
         self._status_label.pack(fill="x", pady=(0, 10))
 
-        # Output video preview
-        self._video_preview_frame = ctk.CTkFrame(left, corner_radius=6)
-        self._video_preview_frame.pack(fill="x", pady=(0, 10))
-        self._video_preview_frame.grid_columnconfigure(0, weight=1)
+        # Progress stats (videos, fps, ETA)
+        self._stats_label = ctk.CTkLabel(left, text="", text_color="gray", font=ctk.CTkFont(size=11))
+        self._stats_label.pack(fill="x", pady=(0, 10))
 
-        ctk.CTkLabel(self._video_preview_frame, text="Output Video Preview", font=ctk.CTkFont(weight="bold")).grid(
-            row=0, column=0, sticky="w", padx=10, pady=(10, 5)
-        )
-
-        self._video_canvas = tk.Canvas(self._video_preview_frame, bg="#1a1a1a", height=200, highlightthickness=0)
-        self._video_canvas.grid(row=1, column=0, sticky="ew", padx=10, pady=(0, 10))
-        self._video_photo = None
-
-        # Video controls
-        vid_ctrl = ctk.CTkFrame(self._video_preview_frame, corner_radius=0)
-        vid_ctrl.grid(row=2, column=0, sticky="ew", padx=10, pady=(0, 10))
-        vid_ctrl.grid_columnconfigure(1, weight=1)
-
-        self._play_btn = ctk.CTkButton(vid_ctrl, text="▶ Play", width=80, command=self._toggle_video_playback, state="disabled")
-        self._play_btn.grid(row=0, column=0, padx=5, pady=5)
-
-        self._video_time_label = ctk.CTkLabel(vid_ctrl, text="00:00 / 00:00")
-        self._video_time_label.grid(row=0, column=1, padx=5, pady=5)
-
-        ctk.CTkButton(vid_ctrl, text="Open Folder", width=100, command=self._open_output_folder).grid(
-            row=0, column=2, padx=5, pady=5
-        )
-
-        # Right panel: ROI Canvas
+        # Right panel: ROI Canvas + Output Video Preview
         right = ctk.CTkFrame(content, corner_radius=6)
         right.grid(row=0, column=1, sticky="nsew", padx=(5, 0))
-        right.grid_rowconfigure(1, weight=1)
+        right.grid_rowconfigure(1, weight=0)
+        right.grid_rowconfigure(6, weight=1)
         right.grid_columnconfigure(0, weight=1)
 
         ctk.CTkLabel(
             right, text="ROI Editor (select video from list)", font=ctk.CTkFont(weight="bold")
         ).grid(row=0, column=0, sticky="w", padx=10, pady=10)
-
-        self._roi_canvas = tk.Canvas(right, bg="#1a1a1a", highlightthickness=0)
-        self._roi_canvas.grid(row=1, column=0, sticky="nsew", padx=10, pady=(0, 10))
-        self._roi_canvas.bind("<Button-1>", self._on_canvas_press)
-        self._roi_canvas.bind("<B1-Motion>", self._on_canvas_drag)
-        self._roi_canvas.bind("<ButtonRelease-1>", self._on_canvas_release)
-        self._roi_canvas.bind("<MouseWheel>", self._on_mousewheel)
-        self._roi_canvas.bind("<Button-4>", self._on_mousewheel)
-        self._roi_canvas.bind("<Button-5>", self._on_mousewheel)
-        self._roi_canvas.bind("<Configure>", self._on_canvas_configure)
 
         self._roi_photo = None
         self._roi_image = None
@@ -289,8 +361,8 @@ class BehaviorQuantificationGUI(ctk.CTk):
         self._zoom_scale = 1.0
         self._base_fit_scale = 1.0
 
-        # ROI list panel
-        roi_list_frame = ctk.CTkFrame(right, corner_radius=6)
+        # ROI list panel (scrollable, fixed height)
+        roi_list_frame = ctk.CTkScrollableFrame(right, corner_radius=6, height=220)
         roi_list_frame.grid(row=2, column=0, sticky="ew", padx=10, pady=(0, 5))
         roi_list_frame.grid_columnconfigure(0, weight=1)
 
@@ -333,6 +405,106 @@ class BehaviorQuantificationGUI(ctk.CTk):
             row=0, column=7, padx=5, pady=5
         )
 
+        # Settings persistence row
+        settings_ctrl = ctk.CTkFrame(right, corner_radius=0)
+        settings_ctrl.grid(row=4, column=0, sticky="ew", padx=10, pady=(0, 10))
+        settings_ctrl.grid_columnconfigure(4, weight=1)
+
+        ctk.CTkButton(settings_ctrl, text="Apply ROIs to All Videos", width=150,
+                      command=self._apply_rois_to_all_videos).grid(
+            row=0, column=0, padx=5, pady=5
+        )
+        ctk.CTkButton(settings_ctrl, text="Save Settings", width=110,
+                      command=self._save_settings_profile).grid(
+            row=0, column=1, padx=5, pady=5
+        )
+        ctk.CTkButton(settings_ctrl, text="Load Settings", width=110,
+                      command=self._load_settings_profile).grid(
+            row=0, column=2, padx=5, pady=5
+        )
+
+        # View toggle: ROI editor vs Results video
+        view_ctrl = ctk.CTkFrame(right, corner_radius=0)
+        view_ctrl.grid(row=5, column=0, sticky="ew", padx=10, pady=(0, 10))
+        view_ctrl.grid_columnconfigure(2, weight=1)
+
+        ctk.CTkLabel(view_ctrl, text="View:").grid(row=0, column=0, padx=5, pady=5)
+        self._view_var = ctk.StringVar(value="roi")
+        self._view_toggle = ctk.CTkSegmentedButton(
+            view_ctrl, variable=self._view_var,
+            values=["ROI View", "Results"],
+            command=self._on_view_toggle,
+            width=180,
+        )
+        self._view_toggle.grid(row=0, column=1, padx=5, pady=5)
+
+        # Shared canvas: ROI view by default; shows result video after run
+        self._canvas_frame = ctk.CTkFrame(right, corner_radius=6)
+        self._canvas_frame.grid(row=6, column=0, sticky="nsew", padx=10, pady=(0, 10))
+        self._canvas_frame.grid_columnconfigure(0, weight=1)
+        self._canvas_frame.grid_rowconfigure(0, weight=1)
+
+        self._canvas = tk.Canvas(self._canvas_frame, bg="#1a1a1a", highlightthickness=0)
+        self._canvas.grid(row=0, column=0, sticky="nsew", padx=10, pady=(0, 10))
+        self._canvas.bind("<Button-1>", self._on_canvas_press)
+        self._canvas.bind("<B1-Motion>", self._on_canvas_drag)
+        self._canvas.bind("<ButtonRelease-1>", self._on_canvas_release)
+        self._canvas.bind("<MouseWheel>", self._on_mousewheel)
+        self._canvas.bind("<Button-4>", self._on_mousewheel)
+        self._canvas.bind("<Button-5>", self._on_mousewheel)
+        self._canvas.bind("<Configure>", self._on_canvas_configure)
+        self._canvas_photo = None
+
+        # Video playback controls (shown only in Results view)
+        self._video_ctrl_frame = ctk.CTkFrame(self._canvas_frame, corner_radius=0)
+        self._video_ctrl_frame.grid(row=1, column=0, sticky="ew", padx=10, pady=(0, 10))
+        self._video_ctrl_frame.grid_columnconfigure(1, weight=1)
+        self._video_ctrl_frame.grid_remove()
+
+        # Row 1: navigation + slider
+        self._nav_row = ctk.CTkFrame(self._video_ctrl_frame, corner_radius=0)
+        self._nav_row.grid(row=0, column=0, columnspan=3, sticky="ew", padx=5, pady=(5, 2))
+        self._nav_row.grid_columnconfigure(1, weight=1)
+
+        self._step_back_btn = ctk.CTkButton(
+            self._nav_row, text="◀◀", width=40,
+            command=lambda: self._step_video(-1), state="disabled",
+        )
+        self._step_back_btn.grid(row=0, column=0, padx=2, pady=2)
+
+        self._frame_slider = ctk.CTkSlider(
+            self._nav_row, from_=0, to=100, number_of_steps=100,
+            command=self._on_frame_slider,
+        )
+        self._frame_slider.grid(row=0, column=1, sticky="ew", padx=5, pady=2)
+
+        self._step_fwd_btn = ctk.CTkButton(
+            self._nav_row, text="▶▶", width=40,
+            command=lambda: self._step_video(1), state="disabled",
+        )
+        self._step_fwd_btn.grid(row=0, column=2, padx=2, pady=2)
+
+        self._frame_label = ctk.CTkLabel(self._nav_row, text="Frame 0 / 0", width=100)
+        self._frame_label.grid(row=0, column=3, padx=5, pady=2)
+
+        # Row 2: play + time + folder
+        self._ctrl_row = ctk.CTkFrame(self._video_ctrl_frame, corner_radius=0)
+        self._ctrl_row.grid(row=1, column=0, columnspan=3, sticky="ew", padx=5, pady=(2, 5))
+
+        self._play_btn = ctk.CTkButton(
+            self._ctrl_row, text="▶ Play", width=80,
+            command=self._toggle_video_playback, state="disabled",
+        )
+        self._play_btn.grid(row=0, column=0, padx=5, pady=5)
+
+        self._video_time_label = ctk.CTkLabel(self._ctrl_row, text="00:00 / 00:00")
+        self._video_time_label.grid(row=0, column=1, padx=5, pady=5)
+
+        ctk.CTkButton(self._ctrl_row, text="Open Folder", width=100,
+                      command=self._open_output_folder).grid(
+            row=0, column=2, padx=5, pady=5
+        )
+
         # Poll queue
         self.after(100, self._poll_queue)
 
@@ -348,6 +520,7 @@ class BehaviorQuantificationGUI(ctk.CTk):
             self._model_entry.delete(0, tk.END)
             self._model_entry.insert(0, path)
             self._find_weights(path)
+            self._save_settings()
 
     def _find_weights(self, session_path: str):
         # Look for weights in typical locations
@@ -407,6 +580,14 @@ class BehaviorQuantificationGUI(ctk.CTk):
             self._output_dir = path
             self._output_entry.delete(0, tk.END)
             self._output_entry.insert(0, path)
+            self._save_settings()
+
+    def _browse_endpoints_output(self):
+        path = filedialog.askdirectory(title="Select Endpoints Output Directory")
+        if path:
+            self._endpoints_output_entry.delete(0, tk.END)
+            self._endpoints_output_entry.insert(0, path)
+            self._save_settings()
 
     def _toggle_video_playback(self):
         if not hasattr(self, '_video_cap') or self._video_cap is None:
@@ -443,18 +624,18 @@ class BehaviorQuantificationGUI(ctk.CTk):
                 return
         frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         img = Image.fromarray(frame_rgb)
-        cw = max(self._video_canvas.winfo_width(), 400)
-        ch = max(self._video_canvas.winfo_height(), 200)
+        cw = max(self._canvas.winfo_width(), 400)
+        ch = max(self._canvas.winfo_height(), 200)
         iw, ih = img.size
         scale = min(cw / iw, ch / ih)
         new_w = int(iw * scale)
         new_h = int(ih * scale)
         img = img.resize((new_w, new_h), Image.LANCZOS)
-        self._video_photo = ImageTk.PhotoImage(img)
-        self._video_canvas.delete("all")
+        self._canvas_photo = ImageTk.PhotoImage(img)
+        self._canvas.delete("all")
         x = (cw - new_w) // 2
         y = (ch - new_h) // 2
-        self._video_canvas.create_image(x, y, anchor="nw", image=self._video_photo)
+        self._canvas.create_image(x, y, anchor="nw", image=self._canvas_photo)
 
         # Update time label
         current_frame = int(self._video_cap.get(cv2.CAP_PROP_POS_FRAMES))
@@ -465,6 +646,83 @@ class BehaviorQuantificationGUI(ctk.CTk):
         # Schedule next frame
         delay = int(1000 / max(self._video_fps, 1))
         self.after(delay, self._play_video_frame)
+        self._update_playback_ui()
+
+    def _update_playback_ui(self):
+        """Refresh slider, frame label, and time label from capture position."""
+        if not hasattr(self, '_video_cap') or self._video_cap is None:
+            return
+        try:
+            current_frame = int(self._video_cap.get(cv2.CAP_PROP_POS_FRAMES))
+        except Exception:
+            return
+        total = max(self._video_total_frames, 1)
+        # Clamp to valid range
+        current_frame = max(0, min(current_frame, total - 1))
+        # Update slider without triggering its callback
+        self._frame_slider.set(current_frame / max(total - 1, 1) * 100)
+        self._frame_label.configure(text=f"Frame {current_frame + 1} / {total}")
+        current_time = current_frame / max(self._video_fps, 1)
+        total_time = self._video_total_frames / max(self._video_fps, 1)
+        self._video_time_label.configure(
+            text=f"{self._format_time(current_time)} / {self._format_time(total_time)}"
+        )
+
+    def _step_video(self, delta: int):
+        """Step forward/backward by delta frames and refresh the display."""
+        if not hasattr(self, '_video_cap') or self._video_cap is None:
+            return
+        was_playing = self._video_playing
+        if was_playing:
+            self._video_playing = False
+            self._play_btn.configure(text="▶ Play")
+        try:
+            current = int(self._video_cap.get(cv2.CAP_PROP_POS_FRAMES))
+            target = max(0, min(current + delta - 1, self._video_total_frames - 1))
+            self._video_cap.set(cv2.CAP_PROP_POS_FRAMES, target)
+        except Exception:
+            return
+        ret, frame = self._video_cap.read()
+        if ret:
+            self._display_frame(frame)
+        self._update_playback_ui()
+
+    def _on_frame_slider(self, value: float):
+        """Seek to the frame indicated by the slider."""
+        if not hasattr(self, '_video_cap') or self._video_cap is None:
+            return
+        was_playing = self._video_playing
+        if was_playing:
+            self._video_playing = False
+            self._play_btn.configure(text="▶ Play")
+        try:
+            total = max(self._video_total_frames, 1)
+            target = int(float(value) / 100.0 * (total - 1))
+            target = max(0, min(target, total - 1))
+            self._video_cap.set(cv2.CAP_PROP_POS_FRAMES, target)
+        except Exception:
+            return
+        ret, frame = self._video_cap.read()
+        if ret:
+            self._display_frame(frame)
+        self._update_playback_ui()
+
+    def _display_frame(self, frame):
+        """Render a BGR frame onto the canvas."""
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        img = Image.fromarray(frame_rgb)
+        cw = max(self._canvas.winfo_width(), 400)
+        ch = max(self._canvas.winfo_height(), 200)
+        iw, ih = img.size
+        scale = min(cw / iw, ch / ih)
+        new_w = int(iw * scale)
+        new_h = int(ih * scale)
+        img = img.resize((new_w, new_h), Image.LANCZOS)
+        self._canvas_photo = ImageTk.PhotoImage(img)
+        self._canvas.delete("all")
+        x = (cw - new_w) // 2
+        y = (ch - new_h) // 2
+        self._canvas.create_image(x, y, anchor="nw", image=self._canvas_photo)
 
     def _format_time(self, seconds: float) -> str:
         m = int(seconds // 60)
@@ -488,6 +746,53 @@ class BehaviorQuantificationGUI(ctk.CTk):
             entry = VideoEntry(path=p)
             self._video_entries.append(entry)
             self._add_video_row(entry)
+        self._save_settings()
+
+    def _load_videos_from_folder(self):
+        """Load all videos from a selected folder and auto-load session settings."""
+        folder = filedialog.askdirectory(title="Select Folder Containing Raw Videos")
+        if not folder:
+            return
+        
+        # Find video files
+        video_extensions = ('.mp4', '.avi', '.mov', '.mkv', '.MP4', '.AVI', '.MOV', '.MKV')
+        video_paths = []
+        for root, dirs, files in os.walk(folder):
+            for f in files:
+                if f.endswith(video_extensions):
+                    video_paths.append(os.path.join(root, f))
+        
+        if not video_paths:
+            messagebox.showinfo("No Videos", f"No video files found in:\n{folder}")
+            return
+        
+        # Clear existing videos
+        self._video_entries.clear()
+        if hasattr(self, "_video_list_frame"):
+            for widget in self._video_list_frame.winfo_children():
+                widget.destroy()
+        
+        # Add all videos
+        for p in sorted(video_paths):
+            entry = VideoEntry(path=p)
+            self._video_entries.append(entry)
+            self._add_video_row(entry)
+        
+        # Load session settings from this folder
+        self._load_session_settings_from_folder(folder)
+        
+        self._save_settings()
+        self._log(f"📁 Loaded {len(video_paths)} videos from {folder}")
+
+    def _load_session_settings_from_folder(self, folder: str):
+        """Load session settings from the specified folder."""
+        data = load_session_settings(folder)
+        if data:
+            self._apply_settings_dict(data)
+            print(f"[BEHAVIOR] Loaded settings from folder: {folder}")
+            self._log(f"⚙️ Loaded session settings from folder")
+        else:
+            print(f"[BEHAVIOR] No session settings found in folder: {folder}")
 
     def _add_video_row(self, entry: VideoEntry):
         row = ctk.CTkFrame(self._video_list_frame, corner_radius=4)
@@ -515,6 +820,7 @@ class BehaviorQuantificationGUI(ctk.CTk):
     def _remove_video(self, entry: VideoEntry, row_frame):
         self._video_entries.remove(entry)
         row_frame.destroy()
+        self._save_settings()
 
     def _select_video_for_roi(self, entry: VideoEntry):
         idx = self._video_entries.index(entry)
@@ -522,6 +828,7 @@ class BehaviorQuantificationGUI(ctk.CTk):
         self._current_roi_idx = -1
         self._load_video_frame(entry.path)
         self._refresh_roi_list()
+        self._save_settings()
 
     def _add_roi(self):
         if self._current_video_idx < 0:
@@ -533,6 +840,7 @@ class BehaviorQuantificationGUI(ctk.CTk):
         self._current_roi_idx = len(entry.rois) - 1
         self._refresh_roi_list()
         self._fit_image_to_canvas()
+        self._save_settings()
 
     def _refresh_roi_list(self):
         # Clear existing ROI rows
@@ -559,6 +867,17 @@ class BehaviorQuantificationGUI(ctk.CTk):
                 row=0, column=1, sticky="ew", padx=5
             )
 
+            # Centroid position display
+            if roi.points:
+                cx = sum(p[0] for p in roi.points) / len(roi.points)
+                cy = sum(p[1] for p in roi.points) / len(roi.points)
+                centroid_text = f"Centroid: ({cx:.1f}, {cy:.1f})"
+            else:
+                centroid_text = "Centroid: N/A"
+            ctk.CTkLabel(row, text=centroid_text, text_color="#88ccff", font=ctk.CTkFont(size=10)).grid(
+                row=1, column=1, sticky="w", padx=5
+            )
+
             # Fish count entry
             fish_count_var = ctk.StringVar(value=str(roi.fish_count))
             ctk.CTkLabel(row, text="Fish:").grid(row=0, column=2, padx=(10, 2), pady=5)
@@ -572,6 +891,7 @@ class BehaviorQuantificationGUI(ctk.CTk):
                         r.fish_count = val
                         if refresh:
                             self._refresh_roi_list()
+                            self._save_settings()
                 except ValueError:
                     pass
             # Save immediately as the user types (no FocusOut/Return required).
@@ -592,6 +912,7 @@ class BehaviorQuantificationGUI(ctk.CTk):
     def _select_roi(self, roi_idx: int):
         self._current_roi_idx = roi_idx
         self._fit_image_to_canvas()
+        self._save_settings()
 
     def _remove_roi(self, roi_idx: int):
         if self._current_video_idx < 0:
@@ -603,6 +924,7 @@ class BehaviorQuantificationGUI(ctk.CTk):
                 self._current_roi_idx = max(-1, self._current_roi_idx - 1)
             self._refresh_roi_list()
             self._fit_image_to_canvas()
+            self._save_settings()
 
     def _load_video_frame(self, video_path: str):
         import cv2
@@ -624,9 +946,9 @@ class BehaviorQuantificationGUI(ctk.CTk):
         if self._roi_image is None:
             return
         # Ensure canvas is laid out before getting dimensions
-        self._roi_canvas.update_idletasks()
-        cw = self._roi_canvas.winfo_width()
-        ch = self._roi_canvas.winfo_height()
+        self._canvas.update_idletasks()
+        cw = self._canvas.winfo_width()
+        ch = self._canvas.winfo_height()
         # Fallback if canvas not laid out yet
         if cw <= 1 or ch <= 1:
             cw, ch = 800, 600
@@ -637,10 +959,10 @@ class BehaviorQuantificationGUI(ctk.CTk):
         new_h = int(ih * scale)
         img = self._roi_image.resize((new_w, new_h), Image.LANCZOS)
         self._roi_photo = ImageTk.PhotoImage(img)
-        self._roi_canvas.delete("all")
+        self._canvas.delete("all")
         x = (cw - new_w) // 2
         y = (ch - new_h) // 2
-        self._roi_canvas.create_image(x, y, anchor="nw", image=self._roi_photo)
+        self._canvas.create_image(x, y, anchor="nw", image=self._roi_photo)
         # Draw all ROIs for this video
         if self._current_video_idx >= 0:
             entry = self._video_entries[self._current_video_idx]
@@ -651,9 +973,9 @@ class BehaviorQuantificationGUI(ctk.CTk):
         if self._roi_image is None:
             return (0, 0)
         # Ensure canvas is laid out before getting dimensions
-        self._roi_canvas.update_idletasks()
-        cw = self._roi_canvas.winfo_width()
-        ch = self._roi_canvas.winfo_height()
+        self._canvas.update_idletasks()
+        cw = self._canvas.winfo_width()
+        ch = self._canvas.winfo_height()
         # Fallback if canvas not laid out yet
         if cw <= 1 or ch <= 1:
             cw, ch = 800, 600
@@ -672,9 +994,9 @@ class BehaviorQuantificationGUI(ctk.CTk):
         if self._roi_image is None:
             return (0, 0)
         # Ensure canvas is laid out before getting dimensions
-        self._roi_canvas.update_idletasks()
-        cw = self._roi_canvas.winfo_width()
-        ch = self._roi_canvas.winfo_height()
+        self._canvas.update_idletasks()
+        cw = self._canvas.winfo_width()
+        ch = self._canvas.winfo_height()
         # Fallback if canvas not laid out yet
         if cw <= 1 or ch <= 1:
             cw, ch = 800, 600
@@ -706,25 +1028,25 @@ class BehaviorQuantificationGUI(ctk.CTk):
             # Draw ROI polygon using all points
             if len(canvas_points) >= 3:
                 flat = [coord for pt in canvas_points for coord in pt]
-                self._roi_canvas.create_polygon(*flat, fill="", outline=color, width=width, tags=f"roi_{i}")
+                self._canvas.create_polygon(*flat, fill="", outline=color, width=width, tags=f"roi_{i}")
             elif roi.shape == "circle" and len(canvas_points) >= 2:
                 x0, y0 = canvas_points[0]
                 x1, y1 = canvas_points[1]
-                self._roi_canvas.create_oval(x0, y0, x1, y1, outline=color, width=width, tags=f"roi_{i}")
+                self._canvas.create_oval(x0, y0, x1, y1, outline=color, width=width, tags=f"roi_{i}")
             elif roi.shape in ("rectangle", "grid") and len(canvas_points) >= 2:
                 x0, y0 = canvas_points[0]
                 x1, y1 = canvas_points[1]
                 dash = (4, 4) if roi.shape == "grid" else ()
-                self._roi_canvas.create_rectangle(x0, y0, x1, y1, outline=color, width=width, dash=dash, tags=f"roi_{i}")
+                self._canvas.create_rectangle(x0, y0, x1, y1, outline=color, width=width, dash=dash, tags=f"roi_{i}")
                 if roi.shape == "grid":
                     rows = 3
                     cols = 3
                     for r in range(1, rows):
                         ry = y0 + (y1 - y0) * r / rows
-                        self._roi_canvas.create_line(x0, ry, x1, ry, fill=color, width=width, dash=(4, 4), tags=f"roi_{i}")
+                        self._canvas.create_line(x0, ry, x1, ry, fill=color, width=width, dash=(4, 4), tags=f"roi_{i}")
                     for c in range(1, cols):
                         cx = x0 + (x1 - x0) * c / cols
-                        self._roi_canvas.create_line(cx, y0, cx, y1, fill=color, width=width, dash=(4, 4), tags=f"roi_{i}")
+                        self._canvas.create_line(cx, y0, cx, y1, fill=color, width=width, dash=(4, 4), tags=f"roi_{i}")
 
             # Draw ROI number/label on the canvas
             if canvas_points:
@@ -740,7 +1062,7 @@ class BehaviorQuantificationGUI(ctk.CTk):
                 if roi.label:
                     label_text = f"{roi.label} ({roi.fish_count})"
 
-                self._roi_canvas.create_text(
+                self._canvas.create_text(
                     cx, cy - 15, text=label_text, fill=color,
                     font=("Arial", 10, "bold"), tags=f"roi_{i}_label"
                 )
@@ -761,25 +1083,25 @@ class BehaviorQuantificationGUI(ctk.CTk):
             roi.shape = self._roi_shape_var.get()
             roi.label = self._roi_label_entry.get() or roi.label
         if self._current_roi_rect:
-            self._roi_canvas.delete(self._current_roi_rect)
+            self._canvas.delete(self._current_roi_rect)
 
     def _on_canvas_drag(self, event):
         if self._roi_drag_start is None or self._current_video_idx < 0 or self._current_roi_idx < 0:
             return
         x0, y0 = self._roi_drag_start
         if self._current_roi_rect:
-            self._roi_canvas.delete(self._current_roi_rect)
+            self._canvas.delete(self._current_roi_rect)
         shape = self._roi_shape_var.get()
         if shape == "rectangle":
-            self._current_roi_rect = self._roi_canvas.create_rectangle(
+            self._current_roi_rect = self._canvas.create_rectangle(
                 x0, y0, event.x, event.y, outline="#38bdf8", width=2
             )
         elif shape == "circle":
-            self._current_roi_rect = self._roi_canvas.create_oval(
+            self._current_roi_rect = self._canvas.create_oval(
                 x0, y0, event.x, event.y, outline="#38bdf8", width=2
             )
         elif shape == "grid":
-            self._current_roi_rect = self._roi_canvas.create_rectangle(
+            self._current_roi_rect = self._canvas.create_rectangle(
                 x0, y0, event.x, event.y, outline="#38bdf8", width=2, dash=(4, 4)
             )
 
@@ -840,7 +1162,7 @@ class BehaviorQuantificationGUI(ctk.CTk):
         roi.label = self._roi_label_entry.get() or roi.label
         self._roi_drag_start = None
         if self._current_roi_rect:
-            self._roi_canvas.delete(self._current_roi_rect)
+            self._canvas.delete(self._current_roi_rect)
             self._current_roi_rect = None
         self._refresh_roi_list()
         self._fit_image_to_canvas()
@@ -886,9 +1208,24 @@ class BehaviorQuantificationGUI(ctk.CTk):
             messagebox.showerror("Error", "Enable at least one video")
             return
 
+        self._save_settings()
+
         self._run_btn.configure(state="disabled", text="Running...")
         self._progress.set(0)
         self._status_label.configure(text="Starting...")
+        self._stats_label.configure(text="")
+
+        self._start_time = time.monotonic()
+        # Count videos that have at least one valid ROI (>= 3 points)
+        vids_with_rois = 0
+        for entry in self._video_entries:
+            valid_rois = [r for r in entry.rois if r.enabled and len(r.points) >= 3]
+            if valid_rois:
+                vids_with_rois += 1
+        self._total_videos = max(vids_with_rois, 1)
+        self._videos_done = 0
+        self._frames_done = 0
+        self._frames_total = 0
 
         self._worker = threading.Thread(target=self._worker_run, daemon=True)
         self._worker.start()
@@ -900,30 +1237,15 @@ class BehaviorQuantificationGUI(ctk.CTk):
                 import yaml
                 import cv2
 
-                self._queue.put(("progress", 0.05, "Preparing configuration..."))
+                self._queue.put(("progress", 0.05, "Preparing configuration...", self._progress_stats(0, self._total_videos, 0.05)))
 
                 # Create a temporary config for the pipeline
                 with tempfile.TemporaryDirectory() as tmpdir:
                     config_path = os.path.join(tmpdir, "behavior_config.yaml")
 
-                    # Get video dimensions for ROI normalization
-                    video_path = self._video_entries[0].path if self._video_entries else ""
-                    if not video_path or not os.path.exists(video_path):
-                        self._queue.put(("error", "No valid video path"))
-                        return
-
-                    cap = cv2.VideoCapture(video_path)
-                    if not cap.isOpened():
-                        self._queue.put(("error", "Cannot open video"))
-                        return
-                    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-                    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-                    cap.release()
-
-                    self._queue.put(("progress", 0.07, f"Video: {width}x{height}"))
-
                     # Build config for the full pipeline
                     session_path = self._model_session
+                    self._session_path = session_path  # Store for endpoints extraction
                     if not os.path.isdir(session_path):
                         self._queue.put(("error", "Invalid model session directory"))
                         return
@@ -940,8 +1262,6 @@ class BehaviorQuantificationGUI(ctk.CTk):
                     # Update with our settings
                     # Use 'best' checkpoint selector for inference with pre-trained weights
                     cfg["WEIGHT"] = "best"
-                    cfg["TRACKING_VIDEO_PATH"] = video_path
-                    cfg["TRACKING_VIDEO_PATH_IS_DIR"] = False
 
                     # Behavior settings
                     if "BEHAVIOR" not in cfg:
@@ -960,21 +1280,72 @@ class BehaviorQuantificationGUI(ctk.CTk):
                         "BOX_THICKNESS": int(self._box_thickness.get()),
                     }
 
-                    # Build ROI_SETS from GUI ROIs (normalized coordinates)
-                    roi_sets = []
-                    tank_entries = []
-                    roi_index = 0
+                    videos_to_process = []
                     for entry in self._video_entries:
-                        if not entry.enabled:
+                        valid_rois = [r for r in entry.rois if r.enabled and len(r.points) >= 3]
+                        if valid_rois:
+                            videos_to_process.append(entry)
+
+                    if not videos_to_process:
+                        self._queue.put(("error", "No videos with valid ROIs (need at least 3 points per ROI)"))
+                        return
+
+                    all_output_videos = []
+                    total_videos = len(videos_to_process)
+
+                    self._queue.put(("progress", 0.1, "Running behavioral quantification...", self._progress_stats(0, self._total_videos, 0.1, 0, self._frames_total)))
+
+                    # Pre-compute total frames across all videos for realtime FPS
+                    self._frames_total = 0
+                    video_frame_counts = []
+                    for entry in videos_to_process:
+                        video_path = entry.path
+                        if not video_path or not os.path.exists(video_path):
+                            video_frame_counts.append(0)
                             continue
+                        cap = cv2.VideoCapture(video_path)
+                        if not cap.isOpened():
+                            video_frame_counts.append(0)
+                            continue
+                        tf = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+                        cap.release()
+                        if tf <= 0:
+                            tf = 0
+                        self._frames_total += tf
+                        video_frame_counts.append(tf)
+
+                    cumulative_frames_before = 0
+
+                    for vid_idx, entry in enumerate(videos_to_process):
+                        video_path = entry.path
+                        if not video_path or not os.path.exists(video_path):
+                            self._queue.put(("log", f"Skipping {os.path.basename(video_path)}: file not found"))
+                            cumulative_frames_before += video_frame_counts[vid_idx]
+                            continue
+
+                        # Get this video's dimensions for ROI normalization
+                        cap = cv2.VideoCapture(video_path)
+                        if not cap.isOpened():
+                            self._queue.put(("error", f"Cannot open video: {video_path}"))
+                            return
+                        v_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                        v_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                        cap.release()
+                        if v_width <= 0 or v_height <= 0:
+                            cumulative_frames_before += video_frame_counts[vid_idx]
+                            continue
+
+                        # Build ROI_SETS for THIS video only
+                        roi_sets = []
+                        tank_entries = []
+                        roi_index = 0
                         for roi in entry.rois:
                             if not roi.enabled or len(roi.points) < 2:
                                 continue
-                            # Convert pixel coordinates to normalized [0,1]
                             pts_norm = []
                             for pt in roi.points:
-                                x_norm = pt[0] / width
-                                y_norm = pt[1] / height
+                                x_norm = pt[0] / v_width
+                                y_norm = pt[1] / v_height
                                 pts_norm.append([float(x_norm), float(y_norm)])
 
                             if len(pts_norm) >= 3:
@@ -983,7 +1354,6 @@ class BehaviorQuantificationGUI(ctk.CTk):
                                     "fish_count": roi.fish_count,
                                     "population": "fixed",
                                 })
-                                # TANKS needs an id field
                                 tank_id = roi.label.strip().replace(" ", "_") if roi.label else f"tank_{roi_index + 1}"
                                 tank_entries.append({
                                     "id": tank_id,
@@ -995,67 +1365,458 @@ class BehaviorQuantificationGUI(ctk.CTk):
                                 })
                                 roi_index += 1
 
-                    if not roi_sets:
-                        self._queue.put(("error", "No valid ROIs with at least 3 points"))
+                        if not roi_sets:
+                            self._queue.put(("log", f"Skipping {os.path.basename(video_path)}: no valid ROIs"))
+                            cumulative_frames_before += video_frame_counts[vid_idx]
+                            continue
+
+                        cfg["ROI_SETS"] = roi_sets
+                        cfg["TANKS"] = tank_entries
+                        cfg["TRACKING_VIDEO_PATH"] = video_path
+                        cfg["TRACKING_VIDEO_PATH_IS_DIR"] = False
+
+                        with open(config_path, "w") as f:
+                            yaml.dump(cfg, f)
+
+                        # Each video occupies an equal slice of the 0.1..0.9 progress range.
+                        # Detection pct (0..1) maps into that slice.
+                        prog_start = 0.1 + 0.8 * vid_idx / max(total_videos, 1)
+                        prog_end = 0.1 + 0.8 * (vid_idx + 1) / max(total_videos, 1)
+                        frames_done = cumulative_frames_before
+                        self._queue.put(("progress", prog_start, f"Processing {os.path.basename(video_path)} ({vid_idx + 1}/{total_videos})", self._progress_stats(vid_idx, total_videos, prog_start, frames_done, self._frames_total)))
+
+                        # Run the standalone behavior quantification module (inference only)
+                        cmd = [
+                            sys.executable, "-u",
+                            os.path.join(PROJECT_ROOT, "main", "behavior_quantification.py"),
+                            config_path
+                        ]
+
+                        proc = subprocess.Popen(
+                            cmd,
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT,
+                            text=True,
+                            bufsize=1,
+                        )
+
+                        # Monitor progress - parse PROGRESS: lines for real-time frame updates
+                        v_total_frames = video_frame_counts[vid_idx]
+                        for line in proc.stdout:
+                            line = line.strip()
+                            if line.startswith("PROGRESS:"):
+                                try:
+                                    pct = float(line.split(":", 1)[1])
+                                    pct = max(0.0, min(1.0, pct))
+                                    prog = prog_start + (prog_end - prog_start) * pct
+                                    frames_done = cumulative_frames_before + int(pct * v_total_frames)
+                                    self._frames_done = frames_done
+                                    self._queue.put(("progress", prog, f"Processing {os.path.basename(video_path)} ({vid_idx + 1}/{total_videos}) - {pct*100:.1f}% frames", self._progress_stats(vid_idx, total_videos, prog, frames_done, self._frames_total)))
+                                except (ValueError, IndexError):
+                                    pass
+                            elif line:
+                                self._queue.put(("log", line))
+
+                        proc.wait()
+
+                        if proc.returncode != 0:
+                            self._queue.put(("error", f"Behavioral quantification failed for {os.path.basename(video_path)} with exit code {proc.returncode}"))
+                            return
+
+                        # Find the output video for this video
+                        output_dir = os.path.join(session_path, "behavior_results")
+                        video_name = os.path.splitext(os.path.basename(video_path))[0]
+                        expected_video = os.path.join(output_dir, f"{video_name}_behavior.mp4")
+                        expected_csv = os.path.join(output_dir, f"{video_name}_behavior.csv")
+                        if os.path.exists(expected_video):
+                            all_output_videos.append(expected_video)
+                            self._queue.put(("log", f"Output: {expected_video}"))
+                        # Track CSV for endpoints extraction
+                        if os.path.exists(expected_csv):
+                            self._queue.put(("tracking_result", video_path, expected_csv))
+
+                        cumulative_frames_before += v_total_frames
+                        self._frames_done = cumulative_frames_before
+                        self._videos_done = vid_idx + 1
+                        prog_done = min(prog_end, 0.9)
+                        self._queue.put(("progress", prog_done, f"Completed {os.path.basename(video_path)} ({vid_idx + 1}/{total_videos})", self._progress_stats(self._videos_done, total_videos, prog_done, self._frames_done, self._frames_total)))
+
+                    if not all_output_videos:
+                        self._queue.put(("error", "No output videos were produced"))
                         return
 
-                    cfg["ROI_SETS"] = roi_sets
+                    # Show the last output video in preview
+                    self._queue.put(("video_ready", all_output_videos[-1]))
 
-                    # Also set TANKS for per-ROI analysis (with required id field)
-                    cfg["TANKS"] = tank_entries
-
-                    with open(config_path, "w") as f:
-                        yaml.dump(cfg, f)
-
-                    self._queue.put(("progress", 0.1, "Running behavioral quantification..."))
-
-                    # Run the standalone behavior quantification module (inference only)
-                    cmd = [
-                        sys.executable, "-u",
-                        os.path.join(PROJECT_ROOT, "main", "behavior_quantification.py"),
-                        config_path
-                    ]
-
-                    proc = subprocess.Popen(
-                        cmd,
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.STDOUT,
-                        text=True,
-                        bufsize=1,
-                    )
-
-                    # Monitor progress
-                    for line in proc.stdout:
-                        self._queue.put(("log", line.strip()))
-
-                    proc.wait()
-
-                    if proc.returncode != 0:
-                        self._queue.put(("error", f"Behavioral quantification failed with exit code {proc.returncode}"))
-                        return
-
-                    self._queue.put(("progress", 0.9, "Finding output files..."))
-
-                    # Find the output video and CSV
-                    output_dir = os.path.join(session_path, "behavior_results")
-                    video_found = False
-                    if os.path.exists(output_dir):
-                        for f in os.listdir(output_dir):
-                            if f.endswith(".mp4") and "behavior" in f.lower():
-                                output_video = os.path.join(output_dir, f)
-                                self._queue.put(("video_ready", output_video))
-                                video_found = True
-
-                    if not video_found:
-                        self._queue.put(("error", "Output video not found"))
-                        return
-
-                    self._queue.put(("progress", 1.0, "Behavioral quantification complete!"))
-                    self._queue.put(("done", "Behavioral quantification complete!"))
+                    self._queue.put(("progress", 1.0, f"Behavioral quantification complete! ({len(all_output_videos)} video(s))", self._progress_stats(len(all_output_videos), total_videos, 1.0, self._frames_done, self._frames_total)))
+                    self._queue.put(("done", f"Behavioral quantification complete! ({len(all_output_videos)} video(s))"))
 
             except Exception as e:
                 import traceback
                 self._queue.put(("error", f"{e}\n{traceback.format_exc()}"))
+
+    def _settings_dict(self) -> Dict[str, Any]:
+        """Serialize current GUI state to a settings dict."""
+        return {
+            "model_session": self._model_session,
+            "weights_path": self._weights_path,
+            "output_dir": self._output_dir,
+            "endpoints_output_dir": self._endpoints_output_entry.get() if hasattr(self, "_endpoints_output_entry") else "",
+            "display": {
+                "arrow_size": int(self._arrow_size.get()) if hasattr(self, "_arrow_size") else 45,
+                "id_font_size": float(self._id_font_size.get()) if hasattr(self, "_id_font_size") else 0.6,
+                "box_thickness": int(self._box_thickness.get()) if hasattr(self, "_box_thickness") else 2,
+                "keypoint_radius": 4,
+                "keypoint_font_size": 0.4,
+                "trail_length": 30,
+            },
+            "behavior": {
+                "extract_head": bool(self._extract_head.get()) if hasattr(self, "_extract_head") else True,
+                "extract_center": bool(self._extract_center.get()) if hasattr(self, "_extract_center") else True,
+                "extract_tail": bool(self._extract_tail.get()) if hasattr(self, "_extract_tail") else True,
+                "analysis": bool(self._behavior_analysis.get()) if hasattr(self, "_behavior_analysis") else True,
+            },
+            "videos": [
+                {
+                    "path": entry.path,
+                    "enabled": entry.enabled,
+                    "rois": [
+                        {
+                            "points": roi.points,
+                            "shape": roi.shape,
+                            "label": roi.label,
+                            "enabled": roi.enabled,
+                            "fish_count": roi.fish_count,
+                        }
+                        for roi in entry.rois
+                    ],
+                }
+                for entry in self._video_entries
+            ],
+        }
+
+    def _apply_settings_dict(self, data: Dict[str, Any]):
+        """Apply a settings dict to the GUI state."""
+        self._model_session = data.get("model_session", "")
+        self._weights_path = data.get("weights_path", "")
+        self._output_dir = data.get("output_dir", "")
+
+        # Update UI fields if they exist
+        if hasattr(self, "_model_entry") and self._model_session:
+            self._model_entry.delete(0, tk.END)
+            self._model_entry.insert(0, self._model_session)
+        if hasattr(self, "_weights_path") and self._weights_path:
+            if hasattr(self, "_weights_label"):
+                self._weights_label.configure(text=f"Weights: {os.path.basename(self._weights_path)}", text_color="white")
+        if hasattr(self, "_output_entry") and self._output_dir:
+            self._output_entry.delete(0, tk.END)
+            self._output_entry.insert(0, self._output_dir)
+
+        disp = data.get("display", {})
+        if hasattr(self, "_arrow_size"):
+            self._arrow_size.set(int(disp.get("arrow_size", 45)))
+        if hasattr(self, "_id_font_size"):
+            self._id_font_size.set(float(disp.get("id_font_size", 0.6)))
+        if hasattr(self, "_box_thickness"):
+            self._box_thickness.set(int(disp.get("box_thickness", 2)))
+
+        beh = data.get("behavior", {})
+        if hasattr(self, "_extract_head"):
+            self._extract_head.set(bool(beh.get("extract_head", True)))
+        if hasattr(self, "_extract_center"):
+            self._extract_center.set(bool(beh.get("extract_center", True)))
+        if hasattr(self, "_extract_tail"):
+            self._extract_tail.set(bool(beh.get("extract_tail", True)))
+        if hasattr(self, "_behavior_analysis"):
+            self._behavior_analysis.set(bool(beh.get("analysis", True)))
+
+        # Restore endpoints output directory
+        ep_out_dir = data.get("endpoints_output_dir", "")
+        if hasattr(self, "_endpoints_output_entry") and ep_out_dir:
+            self._endpoints_output_entry.delete(0, tk.END)
+            self._endpoints_output_entry.insert(0, ep_out_dir)
+
+        # Restore endpoints settings
+        if hasattr(self, "_endpoints_metric_selections"):
+            self._endpoints_metric_selections = data.get("endpoints_metric_selections", {})
+        if hasattr(self, "_endpoints_global_config"):
+            self._endpoints_global_config = data.get("endpoints_global_config", {})
+        if hasattr(self, "_endpoints_arena_configs"):
+            self._endpoints_arena_configs = data.get("endpoints_arena_configs", {})
+        if hasattr(self, "_endpoints_calibration_ratio"):
+            self._endpoints_calibration_ratio = data.get("endpoints_calibration_ratio")
+
+        # Restore video entries with ROIs
+        self._video_entries = []
+        for vd in data.get("videos", []):
+            entry = VideoEntry(path=vd.get("path", ""), enabled=vd.get("enabled", True))
+            for rd in vd.get("rois", []):
+                roi = ROIEntry(
+                    points=rd.get("points", []),
+                    shape=rd.get("shape", "rectangle"),
+                    label=rd.get("label", ""),
+                    enabled=rd.get("enabled", True),
+                    fish_count=rd.get("fish_count", 1),
+                )
+                entry.rois.append(roi)
+            self._video_entries.append(entry)
+
+        # Refresh UI lists
+        if hasattr(self, "_video_list_frame"):
+            for widget in self._video_list_frame.winfo_children():
+                widget.destroy()
+            for entry in self._video_entries:
+                self._add_video_row(entry)
+
+        if hasattr(self, "_current_video_idx"):
+            self._current_video_idx = -1
+        if hasattr(self, "_current_roi_idx"):
+            self._current_roi_idx = -1
+
+    def _save_settings(self):
+        """Persist current settings to disk (session folder first, then legacy)."""
+        # Try session folder first (where videos are loaded from)
+        video_paths = [entry.path for entry in self._video_entries]
+        session_dir = find_session_dir_from_videos(video_paths)
+        
+        settings_data = self._settings_dict()
+        
+        # Add endpoints settings if available
+        if hasattr(self, "_endpoints_metric_selections"):
+            settings_data["endpoints_metric_selections"] = self._endpoints_metric_selections
+        if hasattr(self, "_endpoints_global_config"):
+            settings_data["endpoints_global_config"] = self._endpoints_global_config
+        if hasattr(self, "_endpoints_arena_configs"):
+            settings_data["endpoints_arena_configs"] = self._endpoints_arena_configs
+        if hasattr(self, "_endpoints_calibration_ratio"):
+            settings_data["endpoints_calibration_ratio"] = self._endpoints_calibration_ratio
+        
+        # Save to session folder
+        if session_dir:
+            if save_session_settings(session_dir, settings_data):
+                print(f"[BEHAVIOR] Saved settings to session folder: {session_dir}")
+                return
+        
+        # Fallback to legacy user config directory
+        try:
+            os.makedirs(SETTINGS_DIR, exist_ok=True)
+            with open(SETTINGS_FILE, "w") as f:
+                json.dump(settings_data, f, indent=2)
+            print(f"[BEHAVIOR] Saved settings to legacy location: {SETTINGS_FILE}")
+        except Exception as e:
+            print(f"[BEHAVIOR] Failed to save settings: {e}")
+
+    def _load_settings(self):
+        """Load persisted settings from disk (session folder first, then legacy)."""
+        # Try session folder first
+        video_paths = [entry.path for entry in self._video_entries]
+        session_dir = find_session_dir_from_videos(video_paths)
+        
+        loaded = False
+        if session_dir:
+            data = load_session_settings(session_dir)
+            if data:
+                self._apply_settings_dict(data)
+                print(f"[BEHAVIOR] Loaded settings from session folder: {session_dir}")
+                loaded = True
+        
+        # Fallback to legacy user config directory
+        if not loaded:
+            try:
+                if os.path.exists(SETTINGS_FILE):
+                    with open(SETTINGS_FILE, "r") as f:
+                        data = json.load(f)
+                    self._apply_settings_dict(data)
+                    print(f"[BEHAVIOR] Loaded settings from legacy location: {SETTINGS_FILE}")
+                    loaded = True
+            except Exception as e:
+                print(f"[BEHAVIOR] Failed to load legacy settings: {e}")
+        
+        # If still not loaded, try to find session folder from model session
+        if not loaded and self._model_session:
+            data = load_session_settings(self._model_session)
+            if data:
+                self._apply_settings_dict(data)
+                print(f"[BEHAVIOR] Loaded settings from model session: {self._model_session}")
+                loaded = True
+        
+        # Scan for existing tracking results in model session
+        self._scan_existing_tracking_results()
+        
+    def _scan_existing_tracking_results(self):
+        """Scan model session for existing behavior_results tracking CSVs."""
+        if not self._model_session or not os.path.isdir(self._model_session):
+            return
+            
+        behavior_results_dir = os.path.join(self._model_session, "behavior_results")
+        if not os.path.isdir(behavior_results_dir):
+            return
+            
+        # Look for *_behavior.csv files
+        for entry in self._video_entries:
+            video_name = os.path.splitext(os.path.basename(entry.path))[0]
+            csv_path = os.path.join(behavior_results_dir, f"{video_name}_behavior.csv")
+            if os.path.exists(csv_path):
+                self._tracking_results[entry.path] = csv_path
+                self._log(f"📝 Found existing tracking: {os.path.basename(csv_path)}")
+        
+        # Enable endpoints button if we found any
+        if self._tracking_results:
+            self._endpoints_btn.configure(state="normal")
+            self._log(f"✅ {len(self._tracking_results)} pre-tracked video(s) ready for endpoints extraction.")
+
+    def _save_settings_profile(self):
+        """Save current settings to a user-chosen file."""
+        path = filedialog.asksaveasfilename(
+            title="Save Settings Profile",
+            defaultextension=".json",
+            filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
+            initialdir=SETTINGS_DIR,
+        )
+        if not path:
+            return
+        try:
+            with open(path, "w") as f:
+                json.dump(self._settings_dict(), f, indent=2)
+            messagebox.showinfo("Saved", f"Settings saved to:\n{path}")
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to save settings: {e}")
+
+    def _load_settings_profile(self):
+        """Load settings from a user-chosen file."""
+        path = filedialog.askopenfilename(
+            title="Load Settings Profile",
+            filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
+            initialdir=SETTINGS_DIR,
+        )
+        if not path:
+            return
+        try:
+            with open(path, "r") as f:
+                data = json.load(f)
+            self._apply_settings_dict(data)
+            self._save_settings()
+            messagebox.showinfo("Loaded", f"Settings loaded from:\n{path}")
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to load settings: {e}")
+
+    def _on_view_toggle(self, value=None):
+        """Switch between ROI editor view and Results video view."""
+        view = self._view_var.get()
+        if view == "Results":
+            self._canvas_frame.grid(row=6, column=0, sticky="nsew", padx=10, pady=(0, 10))
+            self._video_ctrl_frame.grid()
+            self._canvas.delete("all")
+            if hasattr(self, '_video_cap') and self._video_cap is not None:
+                ret, frame = self._video_cap.read()
+                if ret:
+                    self._display_frame(frame)
+                self._update_playback_ui()
+        else:
+            self._video_ctrl_frame.grid_remove()
+            self._canvas_frame.grid(row=6, column=0, sticky="nsew", padx=10, pady=(0, 10))
+            self._fit_image_to_canvas()
+
+    def _progress_stats(self, videos_done: int, total_videos: int, progress: float,
+                        frames_done: int = 0, frames_total: int = 0) -> Dict[str, Any]:
+        """Compute a stats dict for the progress display."""
+        elapsed = time.monotonic() - getattr(self, "_start_time", time.monotonic())
+        # Use frames per second for realtime FPS during active processing.
+        fps = (frames_done / elapsed) if elapsed > 0 and frames_done > 0 else 0.0
+        eta = ((frames_total - frames_done) / fps) if fps > 0 else 0.0
+        pct = progress * 100.0
+        return {
+            "videos_done": videos_done,
+            "total_videos": total_videos,
+            "progress": progress,
+            "pct": pct,
+            "elapsed": elapsed,
+            "fps": fps,
+            "eta": eta,
+            "frames_done": frames_done,
+            "frames_total": frames_total,
+        }
+
+    def _apply_rois_to_all_videos(self):
+        """Copy the currently selected video's ROIs to all other videos,
+        normalizing coordinates per-video by resolution."""
+        if self._current_video_idx < 0:
+            messagebox.showinfo("Info", "Select a video first")
+            return
+        src_entry = self._video_entries[self._current_video_idx]
+        if not src_entry.rois:
+            messagebox.showinfo("Info", "No ROIs defined for the selected video")
+            return
+
+        # Get source video dimensions
+        try:
+            cap = cv2.VideoCapture(src_entry.path)
+            if not cap.isOpened():
+                messagebox.showerror("Error", f"Cannot open source video: {src_entry.path}")
+                return
+            src_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            src_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            cap.release()
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to read source video: {e}")
+            return
+
+        if src_w <= 0 or src_h <= 0:
+            messagebox.showerror("Error", "Invalid source video dimensions")
+            return
+
+        # Normalize source ROIs to [0,1]
+        normalized_rois = []
+        for roi in src_entry.rois:
+            norm_points = []
+            for pt in roi.points:
+                norm_points.append([pt[0] / src_w, pt[1] / src_h])
+            normalized_rois.append({
+                "points": norm_points,
+                "shape": roi.shape,
+                "label": roi.label,
+                "enabled": roi.enabled,
+                "fish_count": roi.fish_count,
+            })
+
+        # Apply to all other videos
+        applied_count = 0
+        for entry in self._video_entries:
+            if entry is src_entry:
+                continue
+            try:
+                cap = cv2.VideoCapture(entry.path)
+                if not cap.isOpened():
+                    continue
+                t_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                t_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                cap.release()
+                if t_w <= 0 or t_h <= 0:
+                    continue
+            except Exception:
+                continue
+
+            entry.rois = []
+            for nr in normalized_rois:
+                pts = []
+                for pt in nr["points"]:
+                    pts.append((pt[0] * t_w, pt[1] * t_h))
+                roi = ROIEntry(
+                    points=pts,
+                    shape=nr["shape"],
+                    label=nr["label"],
+                    enabled=nr["enabled"],
+                    fish_count=nr["fish_count"],
+                )
+                entry.rois.append(roi)
+            applied_count += 1
+
+        self._save_settings()
+        messagebox.showinfo(
+            "Applied",
+            f"ROIs applied to {applied_count} other video(s).\n"
+            "Coordinates are normalized per-video resolution.",
+        )
 
     def _poll_queue(self):
         try:
@@ -1064,22 +1825,94 @@ class BehaviorQuantificationGUI(ctk.CTk):
                 if msg[0] == "progress":
                     self._progress.set(msg[1])
                     self._status_label.configure(text=msg[2])
+                    # Display detailed stats if provided (4-tuple)
+                    if len(msg) >= 4 and isinstance(msg[3], dict):
+                        st = msg[3]
+                        elapsed_s = st.get("elapsed", 0)
+                        eta_s = st.get("eta", 0)
+                        fps = st.get("fps", 0)
+                        vd = st.get("videos_done", 0)
+                        tv = st.get("total_videos", 0)
+                        pct = st.get("progress", 0) * 100
+                        stats_text = (
+                            f"Videos: {vd}/{tv}  |  Progress: {pct:.1f}%  |  "
+                            f"FPS: {fps:.2f}  |  Elapsed: {self._format_time(elapsed_s)}  |  "
+                            f"ETA: {self._format_time(eta_s) if eta_s > 0 else '--:--'}"
+                        )
+                        self._stats_label.configure(text=stats_text)
                 elif msg[0] == "log":
                     print(f"[BEHAVIOR] {msg[1]}")
+                elif msg[0] == "tracking_result":
+                    video_path, csv_path = msg[1], msg[2]
+                    self._tracking_results[video_path] = csv_path
+                    self._log(f"📝 Tracking CSV ready: {os.path.basename(csv_path)}")
                 elif msg[0] == "video_ready":
                     self._load_output_video(msg[1])
                 elif msg[0] == "done":
                     self._progress.set(1)
                     self._status_label.configure(text=msg[1], text_color="green")
                     self._run_btn.configure(state="normal", text="Run Quantification")
+                    # Enable endpoints button if we have tracking results
+                    if self._tracking_results:
+                        self._endpoints_btn.configure(state="normal")
+                        self._log(f"✅ Tracking complete! {len(self._tracking_results)} video(s) ready for endpoints extraction.")
                     messagebox.showinfo("Complete", msg[1])
                 elif msg[0] == "error":
                     self._status_label.configure(text=f"Error: {msg[1]}", text_color="red")
+                    self._stats_label.configure(text="")
                     self._run_btn.configure(state="normal", text="Run Quantification")
                     messagebox.showerror("Error", msg[1])
         except queue.Empty:
             pass
         self.after(100, self._poll_queue)
+
+    def _log(self, msg: str):
+        """Log message to console (stdout for now, could be extended to UI)."""
+        print(f"[BEHAVIOR] {msg}")
+
+    def _run_endpoints_extraction(self):
+        """Launch the endpoints extraction dialog."""
+        if not self._tracking_results:
+            messagebox.showwarning("No Data", "No tracking results available. Run quantification first.")
+            return
+        if not self._model_session:
+            messagebox.showwarning("No Session", "Model session not set.")
+            return
+            
+        from gui.endpoints_dialog import show_endpoints_extraction_dialog
+        
+        # Default all metrics enabled (selection happens in endpoints dialog)
+        all_default_metrics = {
+            "Average Speed (cm/s)": True,
+            "Freezing Time Ratio (%)": True,
+            "Swimming Time Ratio (%)": True,
+            "Rapid Movement Time Ratio (%)": True,
+            "Time in Top Percentage (%)": True,
+            "Time in Bottom Percentage (%)": True,
+            "Average Thigmotaxis (cm)": True,
+            "Fractal Dimension": True,
+            "Entropy": True,
+            "Average Speed (body-length/s)": True,
+            "Freezing Time Ratio (body-length/s) (%)": True,
+            "Swimming Time Ratio (body-length/s) (%)": True,
+            "Rapid Movement Time Ratio (body-length/s) (%)": True,
+        }
+        
+        # Get endpoints output directory
+        ep_output_dir = self._endpoints_output_entry.get().strip()
+        
+        def on_complete(result):
+            self._log(f"Endpoints extraction complete: {result.get('output_dir', 'unknown')}")
+            
+        show_endpoints_extraction_dialog(
+            self,
+            self._video_entries,
+            self._tracking_results,
+            self._model_session,
+            all_default_metrics,
+            ep_output_dir,
+            on_complete,
+        )
 
     def _load_output_video(self, video_path: str):
         """Load the output video for preview."""
@@ -1088,24 +1921,17 @@ class BehaviorQuantificationGUI(ctk.CTk):
             self._video_fps = self._video_cap.get(cv2.CAP_PROP_FPS) or 30
             self._video_total_frames = int(self._video_cap.get(cv2.CAP_PROP_FRAME_COUNT))
             self._play_btn.configure(state="normal")
+            self._step_back_btn.configure(state="normal")
+            self._step_fwd_btn.configure(state="normal")
+            self._frame_slider.configure(from_=0, to=100, number_of_steps=max(self._video_total_frames - 1, 1))
+            # Switch to Results view and show controls
+            self._view_var.set("Results")
+            self._on_view_toggle()
             # Show first frame
             ret, frame = self._video_cap.read()
             if ret:
-                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                img = Image.fromarray(frame_rgb)
-                cw = max(self._video_canvas.winfo_width(), 400)
-                ch = max(self._video_canvas.winfo_height(), 200)
-                iw, ih = img.size
-                scale = min(cw / iw, ch / ih)
-                new_w = int(iw * scale)
-                new_h = int(ih * scale)
-                img = img.resize((new_w, new_h), Image.LANCZOS)
-                self._video_photo = ImageTk.PhotoImage(img)
-                self._video_canvas.delete("all")
-                x = (cw - new_w) // 2
-                y = (ch - new_h) // 2
-                self._video_canvas.create_image(x, y, anchor="nw", image=self._video_photo)
-                self._video_time_label.configure(text=f"00:00 / {self._format_time(self._video_total_frames / max(self._video_fps, 1))}")
+                self._display_frame(frame)
+            self._update_playback_ui()
         except Exception as e:
             print(f"Failed to load output video: {e}")
 

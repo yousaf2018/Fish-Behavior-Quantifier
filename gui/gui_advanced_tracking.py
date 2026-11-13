@@ -261,8 +261,11 @@ class ConfigGUI(ctk.CTk):
         self._prefill_session_path = session_path or ""
         self._prefill_training_video_path = training_video_path or ""
         self._prefill_tracking_video_path = tracking_video_path or training_video_path or ""
-        self.title("FBQ Tracking")
-        self.geometry("1400x1000")
+        self.title("FBQ — Advanced Tracking")
+        # Full screen
+        screen_w = self.winfo_screenwidth()
+        screen_h = self.winfo_screenheight()
+        self.geometry(f"{screen_w}x{screen_h}+0+0")
         self.minsize(1000, 600)
         self.grid_columnconfigure(0, weight=1)
         self.grid_rowconfigure(0, weight=1)

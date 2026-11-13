@@ -1,0 +1,50 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 200">
+  <defs>
+    <linearGradient id="waterGradient" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#0ea5e9;stop-opacity:1" />
+      <stop offset="50%" style="stop-color:#06b6d4;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#0891b2;stop-opacity:1" />
+    </linearGradient>
+    <linearGradient id="fishGradient" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" style="stop-color:#22d3ee;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#06b6d4;stop-opacity:1" />
+    </linearGradient>
+    <filter id="glow" x="-50%" y="-50%" width="200%" height="200%">
+      <feGaussianBlur stdDeviation="3" result="coloredBlur"/>
+      <feMerge>
+        <feMergeNode in="coloredBlur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+  </defs>
+  
+  <!-- Water background circle -->
+  <circle cx="100" cy="100" r="95" fill="url(#waterGradient)" opacity="0.15"/>
+  
+  <!-- Fish body -->
+  <ellipse cx="100" cy="105" rx="55" ry="32" fill="url(#fishGradient)" filter="url(#glow)"/>
+  
+  <!-- Fish tail -->
+  <path d="M45 105 Q25 85 25 105 Q25 125 45 105" fill="url(#fishGradient)" filter="url(#glow)"/>
+  
+  <!-- Fish head direction indicator -->
+  <ellipse cx="150" cy="100" rx="12" ry="18" fill="url(#fishGradient)" filter="url(#glow)"/>
+  
+  <!-- Eye -->
+  <circle cx="155" cy="97" r="5" fill="#0d1216"/>
+  <circle cx="156" cy="96" r="2" fill="#22d3ee"/>
+  
+  <!-- Tracking dots (representing multi-fish tracking) -->
+  <circle cx="70" cy="65" r="4" fill="#22d3ee" opacity="0.7"/>
+  <circle cx="130" cy="145" r="3" fill="#22d3ee" opacity="0.7"/>
+  <circle cx="60" cy="135" r="3" fill="#22d3ee" opacity="0.7"/>
+  <circle cx="140" cy="70" r="3" fill="#22d3ee" opacity="0.7"/>
+  
+  <!-- Direction arrows (representing behavior analysis) -->
+  <path d="M85 70 Q95 60 105 70" stroke="#22d3ee" stroke-width="2" fill="none" opacity="0.6" stroke-dasharray="5,3"/>
+  <path d="M115 140 Q125 130 135 140" stroke="#22d3ee" stroke-width="2" fill="none" opacity="0.6" stroke-dasharray="5,3"/>
+  
+  <!-- FBQ text -->
+  <text x="100" y="185" font-family="Arial, sans-serif" font-size="18" font-weight="bold" fill="#0ea5e9" text-anchor="middle" letter-spacing="4">FBQ</text>
+  <text x="100" y="202" font-family="Arial, sans-serif" font-size="10" fill="#64748b" text-anchor="middle">Fish Behavior Quantifier</text>
+</svg>

@@ -1,0 +1,5 @@
+Arena_ID,Average Speed (cm/s),Freezing Time Ratio (%),Swimming Time Ratio (%),Rapid movement time ratio (%),Average Thigmotaxis (cm),Fractal Dimension,Entropy,Average Speed (body-length/s),Freezing Time Ratio (body-length/s) (%),Swimming Time Ratio (body-length/s) (%),Rapid movement time ratio (body-length/s) (%),Video
+1,0.951,8.0,86.25,5.75,11.263,1.973,0.999,0.317,14.833,79.417,5.75,FLX_test2_2026_08_03_FF_water_only_part000.mp4
+2,0.817,13.25,81.667,5.083,12.598,1.972,0.992,0.272,22.417,72.5,5.083,FLX_test2_2026_08_03_FF_water_only_part000.mp4
+3,1.421,5.583,80.667,13.75,15.156,1.971,0.998,0.474,10.75,75.5,13.75,FLX_test2_2026_08_03_FF_water_only_part000.mp4
+4,1.648,12.083,68.833,19.084,7.741,1.974,0.995,0.549,19.333,61.583,19.084,FLX_test2_2026_08_03_FF_water_only_part000.mp4

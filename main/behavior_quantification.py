@@ -231,7 +231,7 @@ def compute_speed(prev_center: Tuple[float, float], curr_center: Tuple[float, fl
 def run_obb_detection(
     model: YOLO,
     video_path: str,
-    roi_mask: np.ndarray,
+    roi_mask: Optional[np.ndarray] = None,
     conf_thresh: float = 0.25,
     iou_thresh: float = 0.5,
     imgsz: int = 1920,
@@ -241,7 +241,13 @@ def run_obb_detection(
     first_frame: int = 0,
     last_frame: int = -1,
 ) -> List[Dict[str, Any]]:
-    """Run OBB detection on video frames within ROI."""
+    """Run OBB detection on video frames.
+
+    When ``roi_mask`` is None the full frame is processed (no masking),
+    so detection runs exactly once per video and detections are later
+    assigned to ROIs by checking whether their centre lies inside each
+    ROI mask. This avoids re-running the model once per ROI.
+    """
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         raise RuntimeError(f"Cannot open video: {video_path}")
@@ -256,16 +262,26 @@ def run_obb_detection(
     frame_buffer = []
     frame_indices = []
     
+    n_frames = last_frame - first_frame + 1
+    
     for frame_idx in range(first_frame, last_frame + 1):
         ret, frame = cap.read()
         if not ret:
             break
         
-        # Apply ROI mask
-        masked_frame = cv2.bitwise_and(frame, frame, mask=roi_mask)
+        # Apply ROI mask only when one is provided; otherwise use full frame.
+        if roi_mask is not None:
+            frame_in = cv2.bitwise_and(frame, frame, mask=roi_mask)
+        else:
+            frame_in = frame
         
-        frame_buffer.append(masked_frame)
+        frame_buffer.append(frame_in)
         frame_indices.append(frame_idx)
+        
+        # Report frame-level progress for GUI responsiveness
+        if (frame_idx - first_frame + 1) % 30 == 0 or frame_idx == last_frame:
+            pct = (frame_idx - first_frame + 1) / max(n_frames, 1)
+            print(f"PROGRESS:{pct:.3f}")
         
         if len(frame_buffer) >= batch_size or frame_idx == last_frame:
             results = model.predict(
@@ -286,19 +302,23 @@ def run_obb_detection(
                         # OBB format: [cx, cy, w, h, angle, conf, cls]
                         cx, cy, w, h, angle, conf, cls = obb[:7]
                         
-                        # Check if center is inside ROI
-                        if roi_mask[int(cy), int(cx)] > 0:
-                            all_detections.append({
-                                "frame": fi,
-                                "cx": float(cx),
-                                "cy": float(cy),
-                                "w": float(w),
-                                "h": float(h),
-                                "angle": float(angle),
-                                "conf": float(conf),
-                                "class": int(cls),
-                                "class_name": DIRECTION_CLASS_NAMES[int(cls)] if int(cls) < len(DIRECTION_CLASS_NAMES) else str(int(cls)),
-                            })
+                        # When a mask is given, keep detections whose centre is
+                        # inside the ROI; otherwise keep everything.
+                        if roi_mask is not None:
+                            if roi_mask[int(cy), int(cx)] <= 0:
+                                continue
+                        
+                        all_detections.append({
+                            "frame": fi,
+                            "cx": float(cx),
+                            "cy": float(cy),
+                            "w": float(w),
+                            "h": float(h),
+                            "angle": float(angle),
+                            "conf": float(conf),
+                            "class": int(cls),
+                            "class_name": DIRECTION_CLASS_NAMES[int(cls)] if int(cls) < len(DIRECTION_CLASS_NAMES) else str(int(cls)),
+                        })
             
             frame_buffer.clear()
             frame_indices.clear()
@@ -812,35 +832,64 @@ def main():
     output_video = os.path.join(output_dir, f"{video_name}_behavior.mp4")
     output_csv = os.path.join(output_dir, f"{video_name}_behavior.csv")
     
-    # Collect all tracked detections across ROIs (unique ids via roi prefix).
-    all_tracked: List[Dict[str, Any]] = []
-    
+    # Build ROI masks (pixel coordinates) - used only for assignment, not detection.
+    roi_masks = []
     for roi_idx, polygon, fish_count in roi_list:
-        print(f"ROI {roi_idx}: {len(polygon)} points, {fish_count} fish")
-        
-        # Convert normalized polygon to pixel coordinates
         pixel_polygon = [[int(x * width), int(y * height)] for x, y in polygon]
         roi_mask = polygon_to_mask(pixel_polygon, width, height)
+        roi_masks.append((roi_idx, roi_mask, fish_count))
+    
+    # Output directory
+    output_dir = os.path.join(session_path, "behavior_results")
+    os.makedirs(output_dir, exist_ok=True)
+    
+    video_name = os.path.splitext(os.path.basename(video_path))[0]
+    output_video = os.path.join(output_dir, f"{video_name}_behavior.mp4")
+    output_csv = os.path.join(output_dir, f"{video_name}_behavior.csv")
+    
+    # STEP 1: Run detection ONCE on the full frame (no ROI mask).
+    # Detections are later assigned to ROIs by checking whether their centre
+    # lies inside each ROI mask. This avoids re-running the model once per ROI.
+    print("Running OBB detection on full frame (once per video)...")
+    all_detections = run_obb_detection(
+        model=model,
+        video_path=video_path,
+        roi_mask=None,
+        conf_thresh=conf_thresh,
+        iou_thresh=iou_thresh,
+        imgsz=imgsz,
+        batch_size=batch_size,
+        device=device,
+        max_det=max(300, num_objects * 2 * len(roi_list)),
+        first_frame=first_frame,
+        last_frame=last_frame,
+    )
+    print(f"Found {len(all_detections)} total detections")
+    
+    # Group detections by frame for ROI assignment.
+    det_by_frame: Dict[int, List[Dict[str, Any]]] = {}
+    for det in all_detections:
+        det_by_frame.setdefault(det["frame"], []).append(det)
+    
+    # STEP 2: For each ROI, filter detections by mask centre, track, collect.
+    all_tracked: List[Dict[str, Any]] = []
+    
+    for roi_idx, roi_mask, fish_count in roi_masks:
+        print(f"ROI {roi_idx}: assigning detections and tracking...")
         
-        print(f"Running OBB detection on ROI {roi_idx}...")
-        detections = run_obb_detection(
-            model=model,
-            video_path=video_path,
-            roi_mask=roi_mask,
-            conf_thresh=conf_thresh,
-            iou_thresh=iou_thresh,
-            imgsz=imgsz,
-            batch_size=batch_size,
-            device=device,
-            max_det=max(300, fish_count * 2),
-            first_frame=first_frame,
-            last_frame=last_frame,
-        )
-        print(f"Found {len(detections)} detections in ROI {roi_idx}")
+        # Filter detections to this ROI (centre inside mask).
+        roi_detections = []
+        for frame_idx, frame_dets in det_by_frame.items():
+            for det in frame_dets:
+                cx, cy = int(det["cx"]), int(det["cy"])
+                if 0 <= cx < width and 0 <= cy < height and roi_mask[cy, cx] > 0:
+                    roi_detections.append(det)
         
-        print(f"Running tracking on ROI {roi_idx}...")
-        tracked = simple_tracking(detections, num_objects=fish_count)
-        print(f"Tracked {len(tracked)} detections in ROI {roi_idx}")
+        print(f"  {len(roi_detections)} detections inside ROI {roi_idx}")
+        
+        # Track within this ROI.
+        tracked = simple_tracking(roi_detections, num_objects=fish_count)
+        print(f"  Tracked {len(tracked)} detections in ROI {roi_idx}")
         
         # Prefix track ids so they are unique across ROIs.
         for det in tracked:

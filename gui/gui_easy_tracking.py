@@ -282,8 +282,11 @@ class EasyTrackingGUI(ctk.CTk):
         super().__init__()
         configure_dpi_scaling(self)
         install_window_icon(self)
-        self.title("FBQ Easy Tracking")
-        self.geometry("1300x840")
+        self.title("FBQ — Train AI Model")
+        # Full screen
+        screen_w = self.winfo_screenwidth()
+        screen_h = self.winfo_screenheight()
+        self.geometry(f"{screen_w}x{screen_h}+0+0")
 
         self._seg_proc: subprocess.Popen | None = None
         self._seg_poll_id: str | None = None

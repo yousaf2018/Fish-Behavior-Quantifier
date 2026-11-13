@@ -47,7 +47,7 @@ COLAB_NOTEBOOK_TEMPLATE = "FBQ_Colab.template.ipynb"
 # path prefix before trusting a version number.
 
 REPO_OWNER = "yousaf2018"
-REPO_NAME = "FBQ"
+REPO_NAME = "Fish-Behavior-Quantifier"
 REPO_SLUG = f"{REPO_OWNER}/{REPO_NAME}"
 
 RELEASES_URL = f"https://github.com/{REPO_SLUG}/releases/latest"

@@ -49,8 +49,11 @@ class ColabSetupApp(ctk.CTk):
         super().__init__()
         configure_dpi_scaling(self)
         install_window_icon(self)
-        self.title("FBQ Google Colab")
-        self.geometry("900x760")
+        self.title("FBQ — Colab Setup")
+        # Full screen
+        screen_w = self.winfo_screenwidth()
+        screen_h = self.winfo_screenheight()
+        self.geometry(f"{screen_w}x{screen_h}+0+0")
         self.minsize(820, 680)
 
         self._config_path = ""

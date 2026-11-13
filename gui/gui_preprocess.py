@@ -617,8 +617,11 @@ class PreprocessApp(ctk.CTk):
         configure_dpi_scaling(self)
         install_window_icon(self)
         self.title(APP_TITLE)
-        self.geometry(f"{WINDOW_W}x{WINDOW_H}")
-        self.minsize(WINDOW_MIN_W, WINDOW_MIN_H)
+        # Full screen
+        screen_w = self.winfo_screenwidth()
+        screen_h = self.winfo_screenheight()
+        self.geometry(f"{screen_w}x{screen_h}+0+0")
+        self.minsize(1200, 820)
 
         self.video_path_var = tk.StringVar()
         self.meta_var = tk.StringVar(value="No video loaded.")
