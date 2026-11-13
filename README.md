@@ -391,7 +391,7 @@ If you use FBQ in your research, please cite:
 ```bibtex
 @software{fbq2026,
   title = {FBQ — Fish Behavior Quantifier},
-  author = {Mahmood Yousaf, Dr. Chung Der Hsiao},
+  author = {Mahmood Yousaf, Gilber AUdira, Dr. Chung Der Hsiao},
   year = {2026},
   url = {https://github.com/yousaf2018/Fish-Behavior-Quantifier},
 }
