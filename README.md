@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="gui/assets/logo_fbq_modern.png" alt="FBQ" style="width: 50%; height: auto;">
+  <img src="assets/logo_fbq_splash.png" alt="FBQ" style="width: 50%; height: auto;">
 </p>
 
 <br>
@@ -13,25 +13,6 @@
 FBQ is a markerless multi-fish tracking system for laboratory tank recordings. It estimates head, center, and tail keypoints for every fish while maintaining individual identities over time. **No manual training annotation and no physical marking is required** — the model learns directly from the videos you provide.
 
 This is a **derivative work** of the original AMADEUS project (Notomi, Matsumura & Dobata, 2026), reworked for fish behavior work. See [Attribution and upstream](#attribution-and-upstream) and [License](#license).
-This is a **derivative work** of the original AMADEUS project (Notomi,
-Matsumura & Dobata, 2026), reworked for fish behavior work. See
-[Attribution and upstream](#attribution-and-upstream) and
-[License](#license).
-
-
-[![Watch the Tool Demonstration](https://img.youtube.com/vi/6EdLrUhgD30/maxresdefault.jpg)](https://www.youtube.com/watch?v=6EdLrUhgD30)
-
-**▶ Watch the complete tool demonstration on YouTube**
-
-## Acknowledgements
-
-This application was developed in the **[Laboratory of Professor Chung-Der Hsiao](https://cdhsiao.weebly.com/pi-cv.html)** in collaboration with **Chung Yuan Christian University, Taiwan 🇹🇼**. Special credit and sincere gratitude are extended to **Professor Hsiao**, who shared his extensive research experience in biology and multiple domains, providing invaluable guidance and supervision throughout the development of this application.
-
-<p align="center">
-  <a href="https://www.cycu.edu.tw/">
-    <img src="https://raw.githubusercontent.com/yousaf2018/EthoGrid/main/images/cycu.jpg" alt="Chung Yuan Christian University Logo" width="250">
-  </a>
-</p>
 
 ---
 
